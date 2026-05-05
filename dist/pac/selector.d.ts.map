@@ -1,1 +1,0 @@
-{"version":3,"file":"selector.d.ts","sourceRoot":"","sources":["../../src/pac/selector.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,OAAO,EAAE,KAAK,EAAe,MAAM,SAAS,CAAC;AACtD,OAAO,EAAE,aAAa,EAAE,MAAM,SAAS,CAAC;AAExC,qBAAa,iBAAkB,YAAW,aAAa;IACrD,WAAW,CAAC,IAAI,EAAE,OAAO,GAAG,KAAK;CAIlC"}
