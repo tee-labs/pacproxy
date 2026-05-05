@@ -47,7 +47,7 @@ jobs:
           git config --global user.name "opencode-agent[bot]"
           git config --global user.email "opencode-agent[bot]@users.noreply.github.com"
       - name: Setup agent
-        uses: tee-labs/agent-standby
+        uses: tee-labs/agent-standby@latest
       - name: Run opencode
         uses: anomalyco/opencode/github@latest
         env:
