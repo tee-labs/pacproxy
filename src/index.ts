@@ -65,6 +65,12 @@ function printUsage(): void {
   console.log('  -v           Send verbose output to STDERR');
 }
 
+function verboseLog(verbose: boolean, ...args: unknown[]): void {
+  if (verbose) {
+    process.stderr.write(`[pacproxy] ${args.map(String).join(' ')}\n`);
+  }
+}
+
 function main(): void {
   const opts = parseArgs(process.argv);
 
@@ -74,9 +80,7 @@ function main(): void {
     process.exit(2);
   }
 
-  if (!opts.verbose) {
-    console.log = () => {};
-  }
+  verboseLog(opts.verbose, 'PAC source:', opts.pac);
 
   const engine = new OttoEngine(smartLoader(opts.pac));
   engine.start();
@@ -86,7 +90,7 @@ function main(): void {
     return;
   }
 
-  startServer(engine, opts.listen);
+  startServer(engine, opts.listen, opts.verbose);
 }
 
 function doResolve(engine: OttoEngine, resolveUrl: string): void {
@@ -107,9 +111,9 @@ function doResolve(engine: OttoEngine, resolveUrl: string): void {
   }
 }
 
-function startServer(engine: OttoEngine, listenAddr: string): void {
+function startServer(engine: OttoEngine, listenAddr: string, verbose: boolean): void {
     const selector = new FirstItemSelector();
-    const proxyHandler = new ProxyHTTPHandler(engine, selector);
+    const proxyHandler = new ProxyHTTPHandler(engine, selector, undefined, verbose);
 
     const [host, portStr] = listenAddr.includes(':')
       ? listenAddr.split(':')
@@ -122,11 +126,11 @@ function startServer(engine: OttoEngine, listenAddr: string): void {
     server.headersTimeout = 65000;
 
   server.listen(port, host, () => {
-    console.log(`Listening on "${listenAddr}"`);
+    process.stdout.write(`Listening on "${listenAddr}"\n`);
   });
 
   process.on('SIGHUP', () => {
-    console.log('SIGHUP');
+    verboseLog(verbose, 'Received SIGHUP, reloading PAC');
     try {
       engine.reload();
     } catch (err: any) {
