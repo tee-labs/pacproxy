@@ -12,6 +12,7 @@ export class ProxyHTTPHandler {
     private readonly proxyFinder: ProxyFinder,
     private readonly proxySelector: ProxySelector,
     nonProxyHandler?: http.RequestListener,
+    private readonly verbose: boolean = false,
   ) {
     this.httpClient = new http.Agent({
       keepAlive: true,
@@ -50,8 +51,17 @@ export class ProxyHTTPHandler {
 
   private async handleHTTP(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     if (req.url && req.url.startsWith('http')) {
+      if (this.verbose) {
+        const proxyUrl = await this.lookupProxy(req);
+        const targetUrl = new URL(req.url);
+        const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
+        process.stderr.write(`[pacproxy] ${req.method} ${targetUrl.host}${targetUrl.pathname} via ${proxy}\n`);
+      }
       await this.doHTTPProxy(req, res);
     } else if (this.nonProxyHandler) {
+      if (this.verbose) {
+        process.stderr.write(`[pacproxy] ${req.method} ${req.url} (non-proxy)\n`);
+      }
       this.nonProxyHandler(req, res);
     } else {
       res.writeHead(400);
@@ -64,6 +74,10 @@ export class ProxyHTTPHandler {
 
     try {
       const proxyUrl = await this.lookupProxy(req);
+      if (this.verbose) {
+        const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
+        process.stderr.write(`[pacproxy] CONNECT ${req.url} via ${proxy}\n`);
+      }
       const targetHostPort = req.url!;
       const colonIdx = targetHostPort.lastIndexOf(':');
       const targetHost = proxyUrl ? proxyUrl.hostname : targetHostPort.substring(0, colonIdx);
