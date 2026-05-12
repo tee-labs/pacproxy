@@ -1,6 +1,8 @@
 export interface Proxy {
   hostname: string;
   port: number;
+  username?: string;
+  password?: string;
 }
 
 export const DirectProxy: Proxy = { hostname: '', port: 0 };
@@ -24,7 +26,8 @@ export class Proxies {
     return this.items
       .map(p => {
         if (isDirectProxy(p)) return 'DIRECT';
-        return `PROXY ${p.hostname}:${p.port}`;
+        const auth = p.username ? `${p.username}:${p.password}@` : '';
+        return `PROXY ${auth}${p.hostname}:${p.port}`;
       })
       .join('; ');
   }

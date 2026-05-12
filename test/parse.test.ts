@@ -24,6 +24,16 @@ describe('parseFindProxyString', () => {
     { in: 'FOO', proxies: [], err: 'unsupported PAC command "FOO"' },
     { in: 'PROXY', proxies: [], err: 'unable to parse proxy details from "PROXY"' },
     { in: 'PROXY proxy.example.com', proxies: [], err: 'unable to parse hostname and port from "proxy.example.com"' },
+    {
+      in: 'PROXY user:pass@proxy.example.com:8080',
+      proxies: [{ hostname: 'proxy.example.com', port: 8080, username: 'user', password: 'pass' }],
+      err: null,
+    },
+    {
+      in: 'PROXY user%40domain:url_encoded%40pass@proxy.example.com:8080',
+      proxies: [{ hostname: 'proxy.example.com', port: 8080, username: 'user@domain', password: 'url_encoded@pass' }],
+      err: null,
+    },
   ];
 
   it.each(parsetests)(
@@ -37,6 +47,10 @@ describe('parseFindProxyString', () => {
         for (let i = 0; i < proxies.length; i++) {
           expect(result.get(i).hostname).toBe(proxies[i].hostname);
           expect(result.get(i).port).toBe(proxies[i].port);
+          if ('username' in proxies[i]) {
+            expect((result.get(i) as any).username).toBe((proxies[i] as any).username);
+            expect((result.get(i) as any).password).toBe((proxies[i] as any).password);
+          }
         }
       }
     }

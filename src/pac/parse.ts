@@ -21,17 +21,35 @@ export function parseFindProxyString(s: string): Proxies {
           throw new Error(`unable to parse proxy details from "${statement}"`);
         }
         const addr = part[1];
-        const colonIdx = addr.lastIndexOf(':');
+
+        // Split out auth portion: "user:pass@host:port"
+        let hostnameAndPort = addr;
+        let username: string | undefined;
+        let password: string | undefined;
+        const atIdx = addr.indexOf('@');
+        if (atIdx >= 0) {
+          const authPart = addr.substring(0, atIdx);
+          hostnameAndPort = addr.substring(atIdx + 1);
+          const colonIdx = authPart.indexOf(':');
+          if (colonIdx >= 0) {
+            username = decodeURIComponent(authPart.substring(0, colonIdx));
+            password = decodeURIComponent(authPart.substring(colonIdx + 1));
+          } else {
+            username = decodeURIComponent(authPart);
+          }
+        }
+
+        const colonIdx = hostnameAndPort.lastIndexOf(':');
         if (colonIdx < 0) {
           throw new Error(`unable to parse hostname and port from "${addr}"`);
         }
-        const hostname = addr.substring(0, colonIdx);
-        const portStr = addr.substring(colonIdx + 1);
+        const hostname = hostnameAndPort.substring(0, colonIdx);
+        const portStr = hostnameAndPort.substring(colonIdx + 1);
         const port = parseInt(portStr, 10);
         if (hostname === '' || portStr === '' || isNaN(port)) {
           throw new Error(`unable to parse hostname and port from "${addr}"`);
         }
-        proxies.push({ hostname, port });
+        proxies.push({ hostname, port, username, password });
         break;
       }
       default:

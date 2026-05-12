@@ -12,7 +12,7 @@ class DirectProxyFinder {
 }
 
 class FixedProxyFinder {
-  constructor(private proxy: { hostname: string; port: number }) {}
+  constructor(private proxy: { hostname: string; port: number; username?: string; password?: string }) {}
   async findProxyForURL(): Promise<any> {
     const { Proxies } = await import('../src/pac/types');
     return new Proxies([this.proxy]);
@@ -160,6 +160,79 @@ describe('ProxyHTTPHandler', () => {
     });
 
     await closeServer(proxyServer);
+    expect(response.body).toContain('hello');
+  }, 10000);
+
+  it('should send Proxy-Authorization to upstream proxy using auth from proxy object', async () => {
+    // Mock upstream proxy that requires auth
+    const upstreamServer = http.createServer();
+    await new Promise<void>(resolve => upstreamServer.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (upstreamServer.address() as net.AddressInfo).port;
+
+    // Use object wrapper to avoid TypeScript narrowing issue with closure-assigned variable
+    const captured: { req: http.IncomingMessage | null } = { req: null };
+    upstreamServer.on('connect', (req, clientSocket, head) => {
+      captured.req = req;
+      if (!req.headers['proxy-authorization']) {
+        clientSocket.write('HTTP/1.1 407 Proxy Auth Required\r\nProxy-Authenticate: Basic\r\n\r\n');
+        clientSocket.end();
+        return;
+      }
+      const targetSocket = net.connect(targetPort, '127.0.0.1', () => {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        targetSocket.write(head);
+        targetSocket.pipe(clientSocket);
+        clientSocket.pipe(targetSocket);
+      });
+      targetSocket.on('error', () => {
+        clientSocket.destroy();
+        targetSocket.destroy();
+      });
+    });
+
+    // FixedProxyFinder returns a proxy with username/password (simulating PAC returning auth)
+    const handler = createTestHandler(new FixedProxyFinder({
+      hostname: '127.0.0.1',
+      port: upstreamPort,
+      username: 'testuser',
+      password: 'testpass',
+    }));
+    const proxyServer = handler.createServer();
+    await new Promise<void>(resolve => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyAddr = proxyServer.address() as net.AddressInfo;
+
+    const response = await new Promise<{ body: string }>((resolve) => {
+      const socket = net.connect(proxyAddr.port, '127.0.0.1', () => {
+        const connectReq = `CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n\r\n`;
+        socket.write(connectReq);
+      });
+      let data = '';
+      let connected = false;
+      socket.on('data', (chunk: Buffer) => {
+        data += chunk.toString();
+        if (!connected && data.includes('\r\n\r\n')) {
+          connected = true;
+          socket.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n');
+        } else if (connected && data.includes('hello')) {
+          resolve({ body: data });
+        }
+      });
+      socket.on('error', () => resolve({ body: data }));
+      setTimeout(() => {
+        socket.destroy();
+        resolve({ body: data });
+      }, 5000);
+    });
+
+    await closeServer(proxyServer);
+    await new Promise<void>(resolve => upstreamServer.close(() => resolve()));
+
+    // Verify the upstream proxy received the Proxy-Authorization header
+    expect(captured.req?.headers['proxy-authorization']).toBeDefined();
+    const authHeader = captured.req?.headers['proxy-authorization'] as string;
+    expect(authHeader).toMatch(/^Basic /);
+    const decoded = Buffer.from(authHeader.substring(6), 'base64').toString();
+    expect(decoded).toBe('testuser:testpass');
     expect(response.body).toContain('hello');
   }, 10000);
 });
