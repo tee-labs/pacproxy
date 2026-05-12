@@ -5,6 +5,7 @@ import { OttoEngine } from './pac/engine';
 import { FirstItemSelector } from './pac/selector';
 import { ProxyHTTPHandler } from './proxy/handler';
 import { smartLoader } from './pac/loader';
+import { Logger } from './logger';
 
 const NAME = 'pacproxy';
 const VERSION = '2.0.7';
@@ -65,35 +66,37 @@ function printUsage(): void {
   console.log('  -v           Send verbose output to STDERR');
 }
 
-function verboseLog(verbose: boolean, ...args: unknown[]): void {
-  if (verbose) {
-    process.stderr.write(`[pacproxy] ${args.map(String).join(' ')}\n`);
-  }
-}
-
 function main(): void {
   const opts = parseArgs(process.argv);
+  const logger = new Logger(opts.verbose);
+
+  logger.info(`${NAME} v${VERSION} starting`);
+  logger.info(ABOUT);
+  logger.info(REPO);
 
   if (!opts.pac.trim()) {
+    logger.error('Missing required flag -c');
     process.stderr.write('Missing required flag -c\n');
     printUsage();
     process.exit(2);
   }
 
-  verboseLog(opts.verbose, 'PAC source:', opts.pac);
+  logger.info('PAC source:', opts.pac);
+  logger.info('Listen address:', opts.listen);
 
-  const engine = new OttoEngine(smartLoader(opts.pac));
+  const engine = new OttoEngine(smartLoader(opts.pac, logger), logger);
   engine.start();
 
   if (opts.resolve) {
-    doResolve(engine, opts.resolve);
+    doResolve(engine, opts.resolve, logger);
     return;
   }
 
-  startServer(engine, opts.listen, opts.verbose);
+  startServer(engine, opts.listen, logger);
 }
 
-function doResolve(engine: OttoEngine, resolveUrl: string): void {
+function doResolve(engine: OttoEngine, resolveUrl: string, logger: Logger): void {
+  logger.info('Resolving proxy for:', resolveUrl);
   try {
     const u = new URL(resolveUrl);
     const proxies = engine.findProxyForURL(u);
@@ -106,14 +109,15 @@ function doResolve(engine: OttoEngine, resolveUrl: string): void {
       }
     }
   } catch (err: any) {
+    logger.error('Resolution failed:', err);
     process.stderr.write(`Error: ${err.message}\n`);
     process.exit(1);
   }
 }
 
-function startServer(engine: OttoEngine, listenAddr: string, verbose: boolean): void {
+function startServer(engine: OttoEngine, listenAddr: string, logger: Logger): void {
     const selector = new FirstItemSelector();
-    const proxyHandler = new ProxyHTTPHandler(engine, selector, undefined, verbose);
+    const proxyHandler = new ProxyHTTPHandler(engine, selector, undefined, logger ? true : false, logger);
 
     const [host, portStr] = listenAddr.includes(':')
       ? listenAddr.split(':')
@@ -126,14 +130,16 @@ function startServer(engine: OttoEngine, listenAddr: string, verbose: boolean): 
     server.headersTimeout = 65000;
 
   server.listen(port, host, () => {
+    logger.info(`Listening on "${listenAddr}"`);
     process.stdout.write(`Listening on "${listenAddr}"\n`);
   });
 
   process.on('SIGHUP', () => {
-    verboseLog(verbose, 'Received SIGHUP, reloading PAC');
+    logger.info('Received SIGHUP, reloading PAC');
     try {
       engine.reload();
     } catch (err: any) {
+      logger.error('Failed to reload PAC:', err);
       process.stderr.write(`Failed to reload PAC: ${err.message}\n`);
       process.exit(1);
     }

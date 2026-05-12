@@ -10,6 +10,7 @@ import {
 } from './types';
 import { parseFindProxyString } from './parse';
 import * as pacfunc from '../pacfunc';
+import { Logger } from '../logger';
 
 export interface OttoEngineOptions {
   loader: Loader;
@@ -19,25 +20,38 @@ export class OttoEngine implements EngineManager, ProxyFinder {
   private isStarted = false;
   private vmContext: vm.Context | null = null;
   private findProxyFn: ((url: string, host: string) => string) | null = null;
+  private pacSource = '';
+  private readonly logger: Logger;
 
-  constructor(private loader?: Loader) {}
+  constructor(private loader?: Loader, extLogger?: Logger) {
+    this.logger = extLogger ?? new Logger(false);
+  }
 
   static withStringLoader(pac: string): OttoEngine {
     return new OttoEngine(() => pac);
   }
 
   start(): void {
-    if (this.isStarted) return;
+    if (this.isStarted) {
+      this.logger.warn('Engine already started, skipping');
+      return;
+    }
 
     const loader = this.loader;
     if (!loader) {
+      this.logger.error('PAC loader has not been configured');
       throw new Error('PAC loader has not been configured');
     }
 
+    this.logger.info('Starting PAC engine...');
     const pac = loader();
+    this.pacSource = pac;
+
     const sandbox = {
       console: {
-        log: (..._args: unknown[]) => {},
+        log: (...args: unknown[]) => {
+          this.logger.debug('[PAC]', ...args);
+        },
       },
       convert_addr: (ipaddr: string): number => pacfunc.convertAddr(ipaddr),
       dnsDomainIs: (host: string, domain: string): boolean =>
@@ -78,32 +92,42 @@ export class OttoEngine implements EngineManager, ProxyFinder {
     if (typeof fn !== 'function') {
       this.vmContext = null;
       if (fn === undefined) {
+        this.logger.error("FindProxyForURL is not defined in PAC script");
         throw new Error("ReferenceError: 'FindProxyForURL' is not defined");
       }
+      this.logger.error('FindProxyForURL is not a function');
       throw new Error('TypeError: "FindProxyForURL" is not a function');
     }
 
     this.findProxyFn = fn as (url: string, host: string) => string;
     this.isStarted = true;
+    this.logger.info('PAC engine started successfully');
   }
 
   stop(): void {
+    this.logger.info('Stopping PAC engine');
     this.vmContext = null;
     this.findProxyFn = null;
+    this.pacSource = '';
     this.isStarted = false;
   }
 
   reload(): void {
+    this.logger.info('Reloading PAC script...');
     this.stop();
     this.start();
   }
 
   findProxyForURL(u: URL): Proxies {
     if (!this.findProxyFn) {
+      this.logger.error('findProxyForURL called but engine not started');
       throw new Error('PAC engine not started');
     }
 
+    this.logger.debug('findProxyForURL:', u.toString());
     const result = String(this.findProxyFn(u.toString(), u.hostname));
+    this.logger.debug('PAC result:', result);
+
     return parseFindProxyString(result);
   }
 }
