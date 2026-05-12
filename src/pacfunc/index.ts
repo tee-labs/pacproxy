@@ -168,7 +168,7 @@ export function weekdayRange(wd1: string, wd2: string, gmt: string): boolean {
 
   let now = defaultNower.now();
   if (gmt === 'GMT') {
-    now = new Date(now.toISOString());
+    now = toUTCGetters(now);
   }
   const today = now.getDay();
 
@@ -198,7 +198,7 @@ export function dateRange(...args: string[]): boolean {
   const isGMT = args[argc - 1] === 'GMT';
   if (isGMT) {
     argc--;
-    now = new Date(now.toISOString());
+    now = toUTCGetters(now);
   }
 
   if (argc === 1) {
@@ -259,6 +259,14 @@ export function dateRange(...args: string[]): boolean {
   return nano1 <= nano && nano <= nano2;
 }
 
+/**
+ * Shift a Date so that its local-time getters return UTC values.
+ * Equivalent to `new Date(d.getTime() + d.getTimezoneOffset() * 60000)`.
+ */
+function toUTCGetters(d: Date): Date {
+  return new Date(d.getTime() + d.getTimezoneOffset() * 60000);
+}
+
 export function timeRange(...args: string[]): boolean {
   let argc = args.length;
   if (argc < 1) return false;
@@ -271,7 +279,7 @@ export function timeRange(...args: string[]): boolean {
   const isGMT = args[argc - 1] === 'GMT';
   if (isGMT) {
     argc--;
-    now = new Date(now.toISOString());
+    now = toUTCGetters(now);
   }
 
   let date1 = new Date(now.getTime());

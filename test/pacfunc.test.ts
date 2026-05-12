@@ -163,7 +163,7 @@ describe('weekdayRange', () => {
 });
 
 function atTime(h: number, m: number, s: number): Date {
-  return new Date(Date.UTC(2018, 0, 1, h, m, s, 0));
+  return new Date(2018, 0, 1, h, m, s, 0);
 }
 
 const dateRangeTests = [
