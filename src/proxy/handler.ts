@@ -3,12 +3,60 @@ import * as net from 'net';
 import { URL } from 'url';
 import { ProxyFinder, ProxySelector, Proxies, Proxy, DirectProxy } from '../pac/types';
 import { Logger } from '../logger';
+import { TcpConnectionPool } from './connection-pool';
 type Socket = net.Socket;
+
+/**
+ * Read the HTTP status line + headers from a socket for a CONNECT response.
+ * Resolves with true (2xx success) or false (non-2xx), or rejects on error/timeout.
+ */
+function readConnectResponse(socket: net.Socket, timeoutMs = 10000): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('CONNECT response timeout'));
+    }, timeoutMs);
+
+    let buf = '';
+    const onData = (chunk: Buffer) => {
+      buf += chunk.toString();
+      const headerEnd = buf.indexOf('\r\n\r\n');
+      if (headerEnd === -1) return;
+
+      cleanup();
+      const statusLine = buf.substring(0, buf.indexOf('\r\n'));
+      const statusCode = parseInt(statusLine.split(' ')[1], 10);
+      resolve(statusCode >= 200 && statusCode < 300);
+    };
+
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+
+    const onClose = () => {
+      cleanup();
+      reject(new Error('Connection closed before CONNECT response'));
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.removeListener('data', onData);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+    };
+
+    socket.on('data', onData);
+    socket.on('error', onError);
+    socket.on('close', onClose);
+  });
+}
 
 export class ProxyHTTPHandler {
   private readonly httpClient: http.Agent;
   private readonly nonProxyHandler: http.RequestListener;
   private readonly logger: Logger;
+  private readonly connPool: TcpConnectionPool;
 
   constructor(
     private readonly proxyFinder: ProxyFinder,
@@ -18,6 +66,7 @@ export class ProxyHTTPHandler {
     private readonly extLogger?: Logger,
   ) {
     this.logger = extLogger ?? new Logger(verbose);
+    this.connPool = new TcpConnectionPool({}, this.logger);
     this.httpClient = new http.Agent({
       keepAlive: true,
       maxSockets: 50,
@@ -67,7 +116,7 @@ export class ProxyHTTPHandler {
         const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
 
         reqLogger.proxyResolution(req.method || 'GET', targetUrl.host, targetUrl.pathname, proxy);
-        await this.doHTTPProxy(req, res);
+        await this.doHTTPProxy(req, res, proxyUrl);
 
         const duration = Date.now() - startTime;
         reqLogger.debug(`${req.method} ${targetUrl.host}${targetUrl.pathname} completed in ${duration}ms via ${proxy}`);
@@ -99,16 +148,20 @@ export class ProxyHTTPHandler {
 
       const targetHostPort = req.url!;
       const colonIdx = targetHostPort.lastIndexOf(':');
-      const targetHost = proxyUrl ? proxyUrl.hostname : targetHostPort.substring(0, colonIdx);
-      const targetPort = proxyUrl
-        ? parseInt(proxyUrl.port, 10) || 443
-        : parseInt(targetHostPort.substring(colonIdx + 1), 10) || 443;
-
-      serverConn = await tcpConnect(targetHost, targetPort);
-      reqLogger.debug(`TCP connection established to ${targetHost}:${targetPort}`);
 
       if (proxyUrl) {
-        const connectReqLines = [`CONNECT ${req.url} HTTP/1.1`, `Host: ${req.url}`];
+        // —— 走上游代理 ——
+        const proxyHost = proxyUrl.hostname;
+        const proxyPort = parseInt(proxyUrl.port, 10) || 3128;
+
+        serverConn = await this.connPool.acquire(proxyHost, proxyPort);
+        reqLogger.debug(`Acquired TCP connection to upstream proxy ${proxyHost}:${proxyPort}`);
+
+        // 构建 CONNECT 请求
+        const connectReqLines = [
+          `CONNECT ${req.url} HTTP/1.1`,
+          `Host: ${req.url}`,
+        ];
         if (proxyUrl.username) {
           const auth = Buffer.from(`${proxyUrl.username}:${proxyUrl.password || ''}`).toString('base64');
           connectReqLines.push(`Proxy-Authorization: Basic ${auth}`);
@@ -116,13 +169,40 @@ export class ProxyHTTPHandler {
         }
         connectReqLines.push('', '');
         serverConn.write(connectReqLines.join('\r\n'));
+
+        // 读取上游代理的 CONNECT 响应
+        const success = await readConnectResponse(serverConn);
+        if (!success) {
+          // 非 2xx 响应 — 将连接放回池中，通知客户端失败
+          this.connPool.release(proxyHost, proxyPort, serverConn);
+          serverConn = null;
+          reqLogger.warn(`Upstream proxy rejected CONNECT for ${req.url}`);
+          clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+          clientSocket.destroy();
+          return;
+        }
+
+        // 2xx — 通知客户端隧道已建立，然后透传上游剩余数据
+        reqLogger.debug('Upstream proxy granted CONNECT tunnel');
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head.length > 0) {
+          serverConn.write(head);
+        }
       } else {
+        // —— 直连目标 ——
+        const targetHost = targetHostPort.substring(0, colonIdx);
+        const targetPort = parseInt(targetHostPort.substring(colonIdx + 1), 10) || 443;
+
+        serverConn = await tcpConnect(targetHost, targetPort);
+        reqLogger.debug(`TCP connection established to target ${targetHost}:${targetPort}`);
+
         clientSocket.write('HTTP/1.0 200 OK\r\n\r\n');
         if (head.length > 0) {
           serverConn.write(head);
         }
       }
 
+      // 建立双向数据管道
       serverConn.pipe(clientSocket);
       clientSocket.pipe(serverConn);
 
@@ -178,18 +258,34 @@ export class ProxyHTTPHandler {
     return proxyUrl;
   }
 
-  private async doHTTPProxy(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  private async doHTTPProxy(req: http.IncomingMessage, res: http.ServerResponse, proxyUrl?: URL | null): Promise<void> {
     removeProxyHeaders(req);
 
     const targetUrl = new URL(req.url!);
-    const options: http.RequestOptions = {
-      hostname: targetUrl.hostname,
-      port: parseInt(targetUrl.port, 10) || 80,
-      path: targetUrl.pathname + targetUrl.search,
-      method: req.method,
-      headers: req.headers,
-      agent: this.httpClient,
-    };
+
+    let options: http.RequestOptions;
+
+    if (proxyUrl) {
+      // 通过上游代理转发：请求发到代理，path 设完整 URL
+      options = {
+        hostname: proxyUrl.hostname,
+        port: parseInt(proxyUrl.port, 10) || 3128,
+        path: req.url,
+        method: req.method,
+        headers: req.headers,
+        agent: this.httpClient,
+      };
+    } else {
+      // 直连目标
+      options = {
+        hostname: targetUrl.hostname,
+        port: parseInt(targetUrl.port, 10) || 80,
+        path: targetUrl.pathname + targetUrl.search,
+        method: req.method,
+        headers: req.headers,
+        agent: this.httpClient,
+      };
+    }
 
     const headers = options.headers as Record<string, any>;
     delete headers['proxy-connection'];
@@ -218,6 +314,7 @@ export class ProxyHTTPHandler {
 function tcpConnect(host: string, port: number): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     const socket = net.connect(port, host);
+    socket.setKeepAlive(true, 30000);
     socket.setTimeout(10000);
     socket.on('connect', () => resolve(socket));
     socket.on('timeout', () => {
@@ -229,9 +326,10 @@ function tcpConnect(host: string, port: number): Promise<net.Socket> {
 }
 
 function removeProxyHeaders(req: http.IncomingMessage): void {
-  delete req.headers['accept-encoding'];
   delete req.headers['proxy-connection'];
   delete req.headers['connection'];
+  // Note: accept-encoding is intentionally passed through to allow
+  // compressed responses from the target server.
 }
 
 function copyHeaders(dst: http.ServerResponse, src: http.OutgoingHttpHeaders): void {
