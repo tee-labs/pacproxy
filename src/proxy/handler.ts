@@ -88,8 +88,14 @@ export class ProxyHTTPHandler {
       serverConn = await tcpConnect(targetHost, targetPort);
 
       if (proxyUrl) {
-        const connectReq = `CONNECT ${req.url} HTTP/1.1\r\nHost: ${req.url}\r\n\r\n`;
-        serverConn.write(connectReq);
+        // Forward Proxy-Authorization to the upstream proxy so it can authenticate
+        const proxyAuth = req.headers['proxy-authorization'];
+        const connectReqLines = [`CONNECT ${req.url} HTTP/1.1`, `Host: ${req.url}`];
+        if (proxyAuth) {
+          connectReqLines.push(`Proxy-Authorization: ${proxyAuth}`);
+        }
+        connectReqLines.push('', '');
+        serverConn.write(connectReqLines.join('\r\n'));
       } else {
         clientSocket.write('HTTP/1.0 200 OK\r\n\r\n');
         if (head.length > 0) {

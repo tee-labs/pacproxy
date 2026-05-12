@@ -162,4 +162,69 @@ describe('ProxyHTTPHandler', () => {
     await closeServer(proxyServer);
     expect(response.body).toContain('hello');
   }, 10000);
+
+  it('should forward Proxy-Authorization to upstream proxy via CONNECT tunnel', async () => {
+    // Set up a mock upstream proxy that requires auth
+    const upstreamServer = http.createServer();
+    await new Promise<void>(resolve => upstreamServer.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (upstreamServer.address() as net.AddressInfo).port;
+
+    const upstreamConnections: net.Socket[] = [];
+    upstreamServer.on('connect', (req, clientSocket, head) => {
+      upstreamConnections.push(clientSocket as net.Socket);
+      // If no Proxy-Authorization, return 407
+      if (!req.headers['proxy-authorization']) {
+        clientSocket.write('HTTP/1.1 407 Proxy Auth Required\r\nProxy-Authenticate: Basic\r\n\r\n');
+        clientSocket.end();
+        return;
+      }
+      // With auth, tunnel to target
+      const targetSocket = net.connect(targetPort, '127.0.0.1', () => {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        targetSocket.write(head);
+        targetSocket.pipe(clientSocket);
+        clientSocket.pipe(targetSocket);
+      });
+      targetSocket.on('error', () => {
+        clientSocket.destroy();
+        targetSocket.destroy();
+      });
+    });
+
+    const handler = createTestHandler(new FixedProxyFinder({ hostname: '127.0.0.1', port: upstreamPort }));
+    const proxyServer = handler.createServer();
+    await new Promise<void>(resolve => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyAddr = proxyServer.address() as net.AddressInfo;
+
+    const authHeader = 'Basic ' + Buffer.from('user:pass').toString('base64');
+    const response = await new Promise<{ body: string }>((resolve) => {
+      const socket = net.connect(proxyAddr.port, '127.0.0.1', () => {
+        const connectReq =
+          `CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${targetPort}\r\n` +
+          `Proxy-Authorization: ${authHeader}\r\n\r\n`;
+        socket.write(connectReq);
+      });
+      let data = '';
+      let connected = false;
+      socket.on('data', (chunk: Buffer) => {
+        data += chunk.toString();
+        if (!connected && data.includes('\r\n\r\n')) {
+          connected = true;
+          socket.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n');
+        } else if (connected && data.includes('hello')) {
+          resolve({ body: data });
+        }
+      });
+      socket.on('error', () => resolve({ body: data }));
+      setTimeout(() => {
+        socket.destroy();
+        resolve({ body: data });
+      }, 5000);
+    });
+
+    await closeServer(proxyServer);
+    await new Promise<void>(resolve => upstreamServer.close(() => resolve()));
+    expect(response.body).toContain('hello');
+  }, 10000);
 });
