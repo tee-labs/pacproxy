@@ -2,18 +2,22 @@ import * as http from 'http';
 import * as net from 'net';
 import { URL } from 'url';
 import { ProxyFinder, ProxySelector, Proxies, Proxy, DirectProxy } from '../pac/types';
+import { Logger } from '../logger';
 type Socket = net.Socket;
 
 export class ProxyHTTPHandler {
   private readonly httpClient: http.Agent;
   private readonly nonProxyHandler: http.RequestListener;
+  private readonly logger: Logger;
 
   constructor(
     private readonly proxyFinder: ProxyFinder,
     private readonly proxySelector: ProxySelector,
     nonProxyHandler?: http.RequestListener,
     private readonly verbose: boolean = false,
+    private readonly extLogger?: Logger,
   ) {
+    this.logger = extLogger ?? new Logger(verbose);
     this.httpClient = new http.Agent({
       keepAlive: true,
       maxSockets: 50,
@@ -25,7 +29,8 @@ export class ProxyHTTPHandler {
 
   createServer(): http.Server {
     const server = http.createServer((req, res) => {
-      this.handleHTTP(req, res).catch(() => {
+      this.handleHTTP(req, res).catch((err) => {
+        this.logger.error('HTTP request failed:', err);
         if (!res.headersSent) {
           res.writeHead(502);
           res.end('Bad Gateway');
@@ -34,7 +39,8 @@ export class ProxyHTTPHandler {
     });
 
     server.on('connect', (req, clientSocket, head) => {
-      this.handleConnect(req, clientSocket as Socket, head).catch(() => {
+      this.handleConnect(req, clientSocket as Socket, head).catch((err) => {
+        this.logger.error('CONNECT tunnel failed:', err);
         clientSocket.destroy();
       });
     });
@@ -51,19 +57,30 @@ export class ProxyHTTPHandler {
 
   private async handleHTTP(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     if (req.url && req.url.startsWith('http')) {
-      if (this.verbose) {
+      const reqId = this.logger.nextRequestId();
+      const reqLogger = this.logger.withRequestId(reqId);
+      const startTime = Date.now();
+
+      try {
         const proxyUrl = await this.lookupProxy(req);
         const targetUrl = new URL(req.url);
         const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
-        process.stderr.write(`[pacproxy] ${req.method} ${targetUrl.host}${targetUrl.pathname} via ${proxy}\n`);
+
+        reqLogger.proxyResolution(req.method || 'GET', targetUrl.host, targetUrl.pathname, proxy);
+        await this.doHTTPProxy(req, res);
+
+        const duration = Date.now() - startTime;
+        reqLogger.debug(`${req.method} ${targetUrl.host}${targetUrl.pathname} completed in ${duration}ms via ${proxy}`);
+      } catch (err: any) {
+        const duration = Date.now() - startTime;
+        reqLogger.error(`${req.method} ${req.url} failed after ${duration}ms:`, err);
+        throw err;
       }
-      await this.doHTTPProxy(req, res);
     } else if (this.nonProxyHandler) {
-      if (this.verbose) {
-        process.stderr.write(`[pacproxy] ${req.method} ${req.url} (non-proxy)\n`);
-      }
+      this.logger.info(`${req.method} ${req.url} (non-proxy)`);
       this.nonProxyHandler(req, res);
     } else {
+      this.logger.warn('Non-proxy request rejected:', req.method, req.url);
       res.writeHead(400);
       res.end();
     }
@@ -71,13 +88,15 @@ export class ProxyHTTPHandler {
 
   private async handleConnect(req: http.IncomingMessage, clientSocket: Socket, head: Buffer): Promise<void> {
     let serverConn: net.Socket | null = null;
+    const reqId = this.logger.nextRequestId();
+    const reqLogger = this.logger.withRequestId(reqId);
+    const startTime = Date.now();
 
     try {
       const proxyUrl = await this.lookupProxy(req);
-      if (this.verbose) {
-        const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
-        process.stderr.write(`[pacproxy] CONNECT ${req.url} via ${proxy}\n`);
-      }
+      const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
+      reqLogger.connectTunnel(req.url || 'unknown', proxy);
+
       const targetHostPort = req.url!;
       const colonIdx = targetHostPort.lastIndexOf(':');
       const targetHost = proxyUrl ? proxyUrl.hostname : targetHostPort.substring(0, colonIdx);
@@ -86,12 +105,14 @@ export class ProxyHTTPHandler {
         : parseInt(targetHostPort.substring(colonIdx + 1), 10) || 443;
 
       serverConn = await tcpConnect(targetHost, targetPort);
+      reqLogger.debug(`TCP connection established to ${targetHost}:${targetPort}`);
 
       if (proxyUrl) {
         const connectReqLines = [`CONNECT ${req.url} HTTP/1.1`, `Host: ${req.url}`];
         if (proxyUrl.username) {
           const auth = Buffer.from(`${proxyUrl.username}:${proxyUrl.password || ''}`).toString('base64');
           connectReqLines.push(`Proxy-Authorization: Basic ${auth}`);
+          reqLogger.debug('Sending Proxy-Authorization for upstream proxy');
         }
         connectReqLines.push('', '');
         serverConn.write(connectReqLines.join('\r\n'));
@@ -108,6 +129,8 @@ export class ProxyHTTPHandler {
       const cleanup = () => {
         if (serverConn && !serverConn.destroyed) serverConn.destroy();
         if (!clientSocket.destroyed) clientSocket.destroy();
+        const duration = Date.now() - startTime;
+        reqLogger.debug(`CONNECT tunnel ${req.url} closed after ${duration}ms`);
       };
 
       serverConn.on('close', cleanup);
@@ -115,6 +138,8 @@ export class ProxyHTTPHandler {
       serverConn.on('error', cleanup);
       clientSocket.on('error', cleanup);
     } catch (err: any) {
+      const duration = Date.now() - startTime;
+      reqLogger.error(`CONNECT ${req.url} failed after ${duration}ms:`, err);
       if (serverConn) serverConn.destroy();
       try {
         clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
