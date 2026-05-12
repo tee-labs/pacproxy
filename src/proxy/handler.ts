@@ -88,8 +88,13 @@ export class ProxyHTTPHandler {
       serverConn = await tcpConnect(targetHost, targetPort);
 
       if (proxyUrl) {
-        const connectReq = `CONNECT ${req.url} HTTP/1.1\r\nHost: ${req.url}\r\n\r\n`;
-        serverConn.write(connectReq);
+        const connectReqLines = [`CONNECT ${req.url} HTTP/1.1`, `Host: ${req.url}`];
+        if (proxyUrl.username) {
+          const auth = Buffer.from(`${proxyUrl.username}:${proxyUrl.password || ''}`).toString('base64');
+          connectReqLines.push(`Proxy-Authorization: Basic ${auth}`);
+        }
+        connectReqLines.push('', '');
+        serverConn.write(connectReqLines.join('\r\n'));
       } else {
         clientSocket.write('HTTP/1.0 200 OK\r\n\r\n');
         if (head.length > 0) {
@@ -130,6 +135,13 @@ export class ProxyHTTPHandler {
     }
 
     const proxyUrl = new URL(`http://${proxy.hostname}:${proxy.port}`);
+    // Auth from PAC file takes priority; client request header can supplement
+    if (proxy.username) {
+      proxyUrl.username = proxy.username;
+      if (proxy.password) {
+        proxyUrl.password = proxy.password;
+      }
+    }
     const proxyAuth = req.headers['proxy-authorization'];
     if (proxyAuth) {
       const parsed = parseBasicAuth(proxyAuth);
