@@ -55,6 +55,31 @@ Listen on all interfaces:
 pacproxy -c proxy.pac -l 0.0.0.0:3128
 ```
 
+### Upstream Proxy Authentication
+
+When the PAC file returns `PROXY upstream.example.com:8080` (without embedded credentials), you can provide authentication via environment variables:
+
+```bash
+# Via .env file (auto-loaded)
+echo "PROXY_USER=myuser" >> .env
+echo "PROXY_PASS=mypassword" >> .env
+pacproxy -c proxy.pac
+
+# Via environment variables
+export PROXY_USER=myuser
+export PROXY_PASS=mypassword
+pacproxy -c proxy.pac
+
+# Single-line
+PROXY_USER=myuser PROXY_PASS=mypassword pacproxy -c proxy.pac
+```
+
+**Auth priority:**
+
+1. PAC file embedded auth — `PROXY user:pass@host:port`
+2. Environment variables — `PROXY_USER` / `PROXY_PASS`
+3. Client `Proxy-Authorization` header
+
 ### SIGHUP — Reload PAC
 
 Send `SIGHUP` to the running process to reload the PAC file without restarting the server:

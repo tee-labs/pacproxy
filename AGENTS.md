@@ -36,3 +36,14 @@ Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 2. Use `detect_changes` for code review.
 3. Use `get_affected_flows` to understand impact.
 4. Use `query_graph` pattern="tests_for" to check coverage.
+
+## Upstream Proxy Auth Resolution
+
+`lookupProxy` in `src/proxy/handler.ts` resolves upstream proxy authentication with this priority:
+
+1. **PAC file embedded auth** — `proxy.username` from parsed `PROXY user:pass@host:port`
+2. **Environment variable fallback** — `process.env.PROXY_USER` / `process.env.PROXY_PASS`
+3. **Client header** — `req.headers['proxy-authorization']` (Basic auth only)
+
+The `.env` file is auto-loaded via `import 'dotenv/config'` in `src/index.ts`.
+PAC auth always takes priority over env vars; env vars take priority over client headers.
