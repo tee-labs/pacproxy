@@ -68,5 +68,6 @@ When `verbose` is `false`, no output is produced regardless of `minLevel`.
 - `--log-level debug` — sets `verbose=true, minLevel=DEBUG`
 - `--log-level error` — sets `verbose=true, minLevel=ERROR`
 - `--log-level` implies `-v` — no need to pass both
+- `-w`, `--watch` — uses `fs.watch` to watch the PAC file and auto-reload the engine on change
 
 Constructor: `new Logger(verbose, minLevel='INFO', requestId='')`

@@ -13,7 +13,7 @@ npm install pacproxy
 ### CLI
 
 ```bash
-pacproxy -c <pac> [-l <listen>] [-v] [-r <url>]
+pacproxy -c <pac> [-l <listen>] [-v] [-w] [--log-level <level>] [-r <url>]
 ```
 
 | Flag | Description |
@@ -21,6 +21,7 @@ pacproxy -c <pac> [-l <listen>] [-v] [-r <url>]
 | `-c` | PAC file name, URL, or JavaScript string (required) |
 | `-l` | Interface and port to listen on (default: `127.0.0.1:8080`) |
 | `-v` | Enable verbose output (INFO level and above) |
+| `-w`, `--watch` | Watch PAC file for changes and auto-reload |
 | `-L`, `--log-level <level>` | Set log level: `debug`, `info`, `warn`, `error` (default: `info`, implies `-v`) |
 | `-r` | Resolve the proxies for a given URL to STDOUT and exit |
 
@@ -80,6 +81,14 @@ PROXY_USER=myuser PROXY_PASS=mypassword pacproxy -c proxy.pac
 1. PAC file embedded auth — `PROXY user:pass@host:port`
 2. Environment variables — `PROXY_USER` / `PROXY_PASS`
 3. Client `Proxy-Authorization` header
+
+Start a proxy server with verbose logging and PAC file auto-reload:
+
+```bash
+pacproxy -c proxy.pac -v -w
+```
+
+Now edit `proxy.pac` — pacproxy will detect the change and reload automatically.
 
 ### SIGHUP — Reload PAC
 

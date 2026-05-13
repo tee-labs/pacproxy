@@ -7,6 +7,7 @@ import { FirstItemSelector } from './pac/selector';
 import { ProxyHTTPHandler } from './proxy/handler';
 import { smartLoader } from './pac/loader';
 import { Logger, type LogLevel } from './logger';
+import { setupFileWatcher } from './watch';
 
 const NAME = 'pacproxy';
 const VERSION = '2.0.7';
@@ -19,6 +20,7 @@ interface CliOptions {
   verbose: boolean;
   logLevel: LogLevel;
   resolve: string;
+  watch: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -28,6 +30,7 @@ function parseArgs(argv: string[]): CliOptions {
     verbose: false,
     logLevel: 'INFO',
     resolve: '',
+    watch: false,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -54,6 +57,10 @@ function parseArgs(argv: string[]): CliOptions {
         }
         break;
       }
+      case '-w':
+      case '--watch':
+        opts.watch = true;
+        break;
       case '-r':
         opts.resolve = argv[++i];
         break;
@@ -80,6 +87,7 @@ function printUsage(): void {
   console.log('  -r string      Resolve the proxies for the provided url to STDOUT and exit');
   console.log('  -v             Enable verbose output (INFO level, use --log-level for more control)');
   console.log('  -L, --log-level <level>  Set log level: debug, info, warn, error (default: info)');
+  console.log('  -w, --watch    Watch PAC file for changes and auto-reload');
 }
 
 function main(): void {
@@ -109,6 +117,15 @@ function main(): void {
   }
 
   startServer(engine, opts.listen, logger);
+
+  if (opts.watch) {
+    const watcher = setupFileWatcher(opts.pac, engine, logger);
+    if (watcher) {
+      process.on('exit', () => watcher.close());
+      process.on('SIGINT', () => watcher.close());
+      process.on('SIGTERM', () => watcher.close());
+    }
+  }
 }
 
 function doResolve(engine: OttoEngine, resolveUrl: string, logger: Logger): void {
