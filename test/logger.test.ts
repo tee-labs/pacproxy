@@ -47,8 +47,8 @@ describe('Logger', () => {
   });
 
   describe('log levels', () => {
-    it('should output DEBUG level messages', () => {
-      const logger = new Logger(true);
+    it('should output DEBUG level messages when minLevel is DEBUG', () => {
+      const logger = new Logger(true, 'DEBUG');
       logger.debug('debug msg');
       expect(stderrOutput[0]).toContain('[DEBUG]');
     });
@@ -69,6 +69,50 @@ describe('Logger', () => {
       const logger = new Logger(true);
       logger.error('error msg');
       expect(stderrOutput[0]).toContain('[ERROR]');
+    });
+
+    it('should suppress DEBUG when minLevel is INFO (default)', () => {
+      const logger = new Logger(true);
+      logger.debug('should be hidden');
+      expect(stderrOutput).toHaveLength(0);
+    });
+
+    it('should suppress INFO when minLevel is WARN', () => {
+      const logger = new Logger(true, 'WARN');
+      logger.info('should be hidden');
+      expect(stderrOutput).toHaveLength(0);
+    });
+
+    it('should suppress WARN when minLevel is ERROR', () => {
+      const logger = new Logger(true, 'ERROR');
+      logger.warn('should be hidden');
+      expect(stderrOutput).toHaveLength(0);
+    });
+
+    it('should show all levels when minLevel is DEBUG', () => {
+      const logger = new Logger(true, 'DEBUG');
+      logger.debug('d');
+      logger.info('i');
+      logger.warn('w');
+      logger.error('e');
+      expect(stderrOutput).toHaveLength(4);
+    });
+
+    it('should output nothing when verbose is false regardless of level', () => {
+      const logger = new Logger(false, 'DEBUG');
+      logger.error('critical');
+      expect(stderrOutput).toHaveLength(0);
+    });
+
+    it('withRequestId should preserve minLevel', () => {
+      const logger = new Logger(true, 'WARN');
+      const child = logger.withRequestId('abc');
+      logger.info('parent info');      // filtered: minLevel=WARN > INFO
+      child.info('child info');        // filtered
+      child.warn('child warn');        // passes
+      expect(stderrOutput).toHaveLength(1);
+      expect(stderrOutput[0]).toContain('[WARN]');
+      expect(stderrOutput[0]).toContain('[abc]');
     });
   });
 

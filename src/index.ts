@@ -6,7 +6,7 @@ import { OttoEngine } from './pac/engine';
 import { FirstItemSelector } from './pac/selector';
 import { ProxyHTTPHandler } from './proxy/handler';
 import { smartLoader } from './pac/loader';
-import { Logger } from './logger';
+import { Logger, type LogLevel } from './logger';
 
 const NAME = 'pacproxy';
 const VERSION = '2.0.7';
@@ -17,6 +17,7 @@ interface CliOptions {
   pac: string;
   listen: string;
   verbose: boolean;
+  logLevel: LogLevel;
   resolve: string;
 }
 
@@ -25,6 +26,7 @@ function parseArgs(argv: string[]): CliOptions {
     pac: '',
     listen: '127.0.0.1:8080',
     verbose: false,
+    logLevel: 'INFO',
     resolve: '',
   };
 
@@ -40,6 +42,18 @@ function parseArgs(argv: string[]): CliOptions {
       case '-v':
         opts.verbose = true;
         break;
+      case '-L':
+      case '--log-level': {
+        const val = argv[++i]?.toLowerCase();
+        if (val === 'debug' || val === 'info' || val === 'warn' || val === 'error') {
+          opts.verbose = true;
+          opts.logLevel = val.toUpperCase() as LogLevel;
+        } else {
+          process.stderr.write(`Invalid log level "${val}". Use: debug, info, warn, error\n`);
+          process.exit(2);
+        }
+        break;
+      }
       case '-r':
         opts.resolve = argv[++i];
         break;
@@ -61,15 +75,16 @@ function printUsage(): void {
   console.log(REPO);
   console.log('');
   console.log('Usage:');
-  console.log('  -c string    PAC file name, url or javascript to use (required)');
-  console.log('  -l string    Interface and port to listen on (default "127.0.0.1:8080")');
-  console.log('  -r string    Resolve the proxies for the provided url to STDOUT and exit');
-  console.log('  -v           Send verbose output to STDERR');
+  console.log('  -c string      PAC file name, url or javascript to use (required)');
+  console.log('  -l string      Interface and port to listen on (default "127.0.0.1:8080")');
+  console.log('  -r string      Resolve the proxies for the provided url to STDOUT and exit');
+  console.log('  -v             Enable verbose output (INFO level, use --log-level for more control)');
+  console.log('  -L, --log-level <level>  Set log level: debug, info, warn, error (default: info)');
 }
 
 function main(): void {
   const opts = parseArgs(process.argv);
-  const logger = new Logger(opts.verbose);
+  const logger = new Logger(opts.verbose, opts.logLevel);
 
   logger.info(`${NAME} v${VERSION} starting`);
   logger.info(ABOUT);
