@@ -159,7 +159,7 @@ npm run dev     # Run directly with ts-node
 
 ## License
 
-Apache-2.0
+Apache 2.0. See [LICENSE](LICENSE).
 
 ## Repository
 
