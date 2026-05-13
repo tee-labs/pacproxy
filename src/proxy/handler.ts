@@ -240,13 +240,19 @@ export class ProxyHTTPHandler {
     }
 
     const proxyUrl = new URL(`http://${proxy.hostname}:${proxy.port}`);
-    // Auth from PAC file takes priority; client request header can supplement
+    // Priority 1: PAC file auth (from proxy object)
     if (proxy.username) {
       proxyUrl.username = proxy.username;
       if (proxy.password) {
         proxyUrl.password = proxy.password;
       }
     }
+    // Priority 2: Environment variable fallback
+    else if (process.env.PROXY_USER) {
+      proxyUrl.username = process.env.PROXY_USER;
+      proxyUrl.password = process.env.PROXY_PASS || '';
+    }
+    // Priority 3: Client request header
     const proxyAuth = req.headers['proxy-authorization'];
     if (proxyAuth) {
       const parsed = parseBasicAuth(proxyAuth);
@@ -255,6 +261,7 @@ export class ProxyHTTPHandler {
         proxyUrl.password = parsed.password;
       }
     }
+
     return proxyUrl;
   }
 
