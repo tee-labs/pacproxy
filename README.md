@@ -20,7 +20,8 @@ pacproxy -c <pac> [-l <listen>] [-v] [-r <url>]
 |------|-------------|
 | `-c` | PAC file name, URL, or JavaScript string (required) |
 | `-l` | Interface and port to listen on (default: `127.0.0.1:8080`) |
-| `-v` | Enable verbose output to STDERR |
+| `-v` | Enable verbose output (INFO level and above) |
+| `-L`, `--log-level <level>` | Set log level: `debug`, `info`, `warn`, `error` (default: `info`, implies `-v`) |
 | `-r` | Resolve the proxies for a given URL to STDOUT and exit |
 
 ### Examples

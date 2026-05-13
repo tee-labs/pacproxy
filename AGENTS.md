@@ -47,3 +47,26 @@ Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 
 The `.env` file is auto-loaded via `import 'dotenv/config'` in `src/index.ts`.
 PAC auth always takes priority over env vars; env vars take priority over client headers.
+
+## Log Level System
+
+The `Logger` in `src/logger.ts` supports both a verbose toggle and a minimum log level:
+
+| Level | Priority | Description |
+|-------|----------|-------------|
+| `DEBUG` | 0 | All messages |
+| `INFO` | 1 | Default — informational + warnings + errors |
+| `WARN` | 2 | Warnings + errors |
+| `ERROR` | 3 | Errors only |
+
+When `verbose` is `false`, no output is produced regardless of `minLevel`.
+`withRequestId()` preserves the current `minLevel` for child loggers.
+
+### CLI flags
+
+- `-v` — sets `verbose=true`, keeps default `minLevel=INFO`
+- `--log-level debug` — sets `verbose=true, minLevel=DEBUG`
+- `--log-level error` — sets `verbose=true, minLevel=ERROR`
+- `--log-level` implies `-v` — no need to pass both
+
+Constructor: `new Logger(verbose, minLevel='INFO', requestId='')`

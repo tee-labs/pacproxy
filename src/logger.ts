@@ -1,4 +1,11 @@
-type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+export type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+
+const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
+  DEBUG: 0,
+  INFO: 1,
+  WARN: 2,
+  ERROR: 3,
+};
 
 const PAD_LEVELS: Record<LogLevel, number> = {
   DEBUG: 5,
@@ -10,8 +17,9 @@ const PAD_LEVELS: Record<LogLevel, number> = {
 /**
  * Structured logger for pacproxy.
  *
- * Outputs to stderr and is only active when verbose mode is enabled.
- * All log lines include ISO timestamps, log level, and optional request ID.
+ * Outputs to stderr and respects both a verbose toggle and a minimum log level.
+ * When verbose is false, nothing is logged.
+ * When verbose is true, only messages at or above minLevel are written.
  *
  * Format: [timestamp] [pacproxy] [LEVEL] [requestId?] message
  */
@@ -20,14 +28,15 @@ export class Logger {
 
   constructor(
     private readonly verbose: boolean,
+    private readonly minLevel: LogLevel = 'INFO',
     private readonly requestId: string = '',
   ) {}
 
   /**
-   * Create a child logger scoped to a specific request ID.
+   * Create a child logger scoped to a specific request ID, preserving minLevel.
    */
   withRequestId(requestId: string): Logger {
-    return new Logger(this.verbose, requestId);
+    return new Logger(this.verbose, this.minLevel, requestId);
   }
 
   /**
@@ -80,6 +89,7 @@ export class Logger {
 
   private write(level: LogLevel, ...args: unknown[]): void {
     if (!this.verbose) return;
+    if (LOG_LEVEL_PRIORITY[level] < LOG_LEVEL_PRIORITY[this.minLevel]) return;
 
     const timestamp = new Date().toISOString();
     const levelPadded = level.padEnd(PAD_LEVELS[level], ' ');
