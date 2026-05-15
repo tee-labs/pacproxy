@@ -71,3 +71,24 @@ When `verbose` is `false`, no output is produced regardless of `minLevel`.
 - `-w`, `--watch` — uses `fs.watch` to watch the PAC file and auto-reload the engine on change
 
 Constructor: `new Logger(verbose, minLevel='INFO', requestId='')`
+
+## Connection Pool & CONNECT Tunnel Behavior
+
+`TcpConnectionPool` in `src/proxy/connection-pool.ts` manages reusable TCP connections to upstream proxies.
+
+### Lifecycle
+
+1. `handleConnect` in `src/proxy/handler.ts` calls `connPool.acquire(host, port)` to get a TCP connection
+2. Sends CONNECT request over the acquired connection
+3. **On success (2xx)**: connection is consumed by the TCP tunnel — `serverConn.pipe(clientSocket)` and vice versa. When the tunnel closes, the connection is **destroyed** (not returned to pool).
+4. **On failure (non-2xx)**: the connection is **destroyed** via `serverConn.destroy()` (not returned to pool). This prevents reusing "spent" TCP connections, because some enterprise proxies (e.g., Pinacolada) reject subsequent CONNECT requests on the same TCP connection.
+
+### Why not pool rejected CONNECT connections?
+
+Some upstream proxies aggressively track per-connection state. Once a CONNECT attempt (even a failed one with 407) is made on a TCP connection, the proxy treats the connection as "consumed" and rejects any future CONNECT on the same connection. Returning the connection to the pool after a failure creates a downward spiral:
+
+```
+Failed CONNECT → release to pool → next request reuses it → rejected again → released again → ...
+```
+
+Destroying the connection after failure ensures every CONNECT attempt gets a fresh TCP connection, which is always accepted by the upstream.

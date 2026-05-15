@@ -236,6 +236,48 @@ describe('ProxyHTTPHandler', () => {
     expect(response.body).toContain('hello');
   }, 10000);
 
+  it('should not return rejected CONNECT connection to pool', async () => {
+    // Upstream proxy that rejects CONNECT but keeps TCP connection alive
+    // (simulating enterprise proxies like proxysg.huawei.com:8080)
+    const upstreamServer = http.createServer();
+    await new Promise<void>(resolve => upstreamServer.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (upstreamServer.address() as net.AddressInfo).port;
+
+    upstreamServer.on('connect', (_req, clientSocket) => {
+      // Reject with 407 but DON'T close — keep TCP alive (like real enterprise proxy)
+      clientSocket.write('HTTP/1.1 407 Proxy Auth Required\r\nProxy-Authenticate: Basic\r\n\r\n');
+    });
+
+    const handler = createTestHandler(new FixedProxyFinder({
+      hostname: '127.0.0.1',
+      port: upstreamPort,
+    }));
+    const proxyServer = handler.createServer();
+    await new Promise<void>(resolve => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyAddr = proxyServer.address() as net.AddressInfo;
+
+    // Send CONNECT — should fail with 502
+    await new Promise<void>((resolve) => {
+      const socket = net.connect(proxyAddr.port, '127.0.0.1', () => {
+        socket.write('CONNECT 127.0.0.1:9999 HTTP/1.1\r\nHost: 127.0.0.1:9999\r\n\r\n');
+      });
+      socket.on('data', () => {});
+      socket.on('close', resolve);
+      socket.on('error', resolve);
+      setTimeout(() => { socket.destroy(); resolve(); }, 2000);
+    });
+
+    // The rejected TCP connection should NOT be in the pool
+    expect((handler as any).connPool.idleCount).toBe(0);
+
+    await closeServer(proxyServer);
+    await new Promise<void>(resolve => {
+      // Force close the upstream server (its socket may be lingering after serverConn.destroy())
+      upstreamServer.close(() => resolve());
+      setTimeout(resolve, 1000);
+    });
+  }, 10000);
+
   describe('env var auth fallback', () => {
     const ORIG_USER = process.env.PROXY_USER;
     const ORIG_PASS = process.env.PROXY_PASS;

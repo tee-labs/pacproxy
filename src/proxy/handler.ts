@@ -173,8 +173,10 @@ export class ProxyHTTPHandler {
         // 读取上游代理的 CONNECT 响应
         const success = await readConnectResponse(serverConn);
         if (!success) {
-          // 非 2xx 响应 — 将连接放回池中，通知客户端失败
-          this.connPool.release(proxyHost, proxyPort, serverConn);
+          // 非 2xx 响应 — 上游代理拒绝 CONNECT
+          // 销毁 TCP 连接而非放回池：某些企业代理（如 Pinacolada）不允许在
+          // 同一个 TCP 连接上重复发送 CONNECT，放回池复用会导致连续失败
+          serverConn.destroy();
           serverConn = null;
           reqLogger.warn(`Upstream proxy rejected CONNECT for ${req.url}`);
           clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
