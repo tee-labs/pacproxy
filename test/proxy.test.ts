@@ -3,6 +3,7 @@ import * as net from 'net';
 import { OttoEngine } from '../src/pac/engine';
 import { FirstItemSelector } from '../src/pac/selector';
 import { ProxyHTTPHandler } from '../src/proxy/handler';
+import { ProxyType } from '../src/pac/types';
 
 class DirectProxyFinder {
   async findProxyForURL(): Promise<any> {
@@ -12,10 +13,10 @@ class DirectProxyFinder {
 }
 
 class FixedProxyFinder {
-  constructor(private proxy: { hostname: string; port: number; username?: string; password?: string }) {}
+  constructor(private proxy: { type?: ProxyType; hostname: string; port: number; username?: string; password?: string }) {}
   async findProxyForURL(): Promise<any> {
     const { Proxies } = await import('../src/pac/types');
-    return new Proxies([this.proxy]);
+    return new Proxies([{ type: 'http' as ProxyType, ...this.proxy }]);
   }
 }
 
@@ -475,8 +476,326 @@ describe('ProxyHTTPHandler', () => {
       await closeServer(proxyServer);
       await new Promise<void>(resolve => upstreamServer.close(() => resolve()));
 
-      expect(captured.req?.headers['proxy-authorization']).toBeUndefined();
-      expect(response.body).toContain('hello');
-    }, 10000);
-  });
+  expect(captured.req?.headers['proxy-authorization']).toBeUndefined();
+  expect(response.body).toContain('hello');
+ }, 10000);
+ });
+
+ describe('SOCKS5 upstream proxy', () => {
+  /**
+   * Minimal mock SOCKS5 proxy server (RFC 1928 + RFC 1929).
+   * Supports NO_AUTH (0x00) and USERNAME/PASSWORD (0x02).
+   * On successful CONNECT, pipes to the target.
+   */
+  function createSocks5Server(options: {
+    requireAuth?: boolean;
+    username?: string;
+    password?: string;
+    rejectConnect?: boolean;
+  } = {}): net.Server {
+    const { requireAuth = false, username, password, rejectConnect = false } = options;
+
+ return net.createServer((clientSocket) => {
+ let step = 0; // 0=method_neg, 1=auth, 2=connect
+
+ const onData = (data: Buffer) => {
+        if (step === 0) {
+          // Method negotiation
+          if (data[0] !== 0x05) { clientSocket.destroy(); return; }
+          const nmethods = data[1];
+          const methods = Array.from(data.slice(2, 2 + nmethods));
+
+          if (requireAuth) {
+            if (methods.includes(0x02)) {
+              clientSocket.write(Buffer.from([0x05, 0x02])); // select USERNAME/PASSWORD
+              step = 1;
+            } else {
+              clientSocket.write(Buffer.from([0x05, 0xff])); // no acceptable
+              clientSocket.end();
+            }
+          } else {
+            if (methods.includes(0x00)) {
+              clientSocket.write(Buffer.from([0x05, 0x00])); // select NO_AUTH
+              step = 2;
+            } else if (methods.includes(0x02)) {
+              clientSocket.write(Buffer.from([0x05, 0x02]));
+              step = 1;
+            } else {
+              clientSocket.write(Buffer.from([0x05, 0xff]));
+              clientSocket.end();
+            }
+          }
+        } else if (step === 1) {
+          // Username/Password sub-negotiation (RFC 1929)
+          if (data[0] !== 0x01) { clientSocket.destroy(); return; }
+          const ulen = data[1];
+          const uname = data.slice(2, 2 + ulen).toString('utf-8');
+          const plen = data[2 + ulen];
+          const pword = data.slice(3 + ulen, 3 + ulen + plen).toString('utf-8');
+
+          if (username && password && uname === username && pword === password) {
+            clientSocket.write(Buffer.from([0x01, 0x00])); // success
+            step = 2;
+          } else {
+            clientSocket.write(Buffer.from([0x01, 0x01])); // failure
+            clientSocket.end();
+          }
+        } else if (step === 2) {
+          // CONNECT request
+          if (data[0] !== 0x05 || data[1] !== 0x01) {
+            // Not a CONNECT command — reject
+            const reply = Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            clientSocket.write(reply);
+            clientSocket.end();
+            return;
+          }
+
+          if (rejectConnect) {
+            const reply = Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]); // connection refused
+            clientSocket.write(reply);
+            clientSocket.end();
+            return;
+          }
+
+          const atyp = data[3];
+          let targetHost: string;
+          let offset: number;
+
+          if (atyp === 0x01) {
+            // IPv4
+            targetHost = `${data[4]}.${data[5]}.${data[6]}.${data[7]}`;
+            offset = 8;
+          } else if (atyp === 0x03) {
+            // Domain
+            const domainLen = data[4];
+            targetHost = data.slice(5, 5 + domainLen).toString('utf-8');
+            offset = 5 + domainLen;
+          } else if (atyp === 0x04) {
+            // IPv6 — not commonly needed in tests
+            clientSocket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+            clientSocket.end();
+            return;
+          } else {
+            clientSocket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+            clientSocket.end();
+            return;
+          }
+
+          const targetPort = data.readUInt16BE(offset);
+
+          // Connect to target
+          const targetSocket = net.connect(targetPort, targetHost, () => {
+            // Send success reply with bound address (0.0.0.0:0)
+            const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            clientSocket.write(reply);
+            // Pipe data — this is now a transparent tunnel
+            targetSocket.pipe(clientSocket);
+            clientSocket.pipe(targetSocket);
+          });
+
+          targetSocket.on('error', () => {
+            const reply = Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            clientSocket.write(reply);
+            clientSocket.end();
+          });
+
+ // Stop the data handler — tunnel is now transparent
+ // Remove the data listener so pipe can take over
+ clientSocket.removeListener('data', onData);
+ }
+ // step === 3: tunnel mode — data is piped, ignore here
+ };
+
+ clientSocket.on('data', onData);
+
+ clientSocket.on('error', () => {});
+    });
+  }
+
+  function closeNetServer(server: net.Server): Promise<void> {
+    return new Promise((resolve) => server.close(() => resolve()));
+  }
+
+  it('should handle CONNECT tunnel via SOCKS5 upstream (no auth)', async () => {
+    const socks5Server = createSocks5Server();
+    await new Promise<void>(resolve => socks5Server.listen(0, '127.0.0.1', resolve));
+    const socks5Port = (socks5Server.address() as net.AddressInfo).port;
+
+    const handler = createTestHandler(new FixedProxyFinder({
+      type: 'socks5' as ProxyType,
+      hostname: '127.0.0.1',
+      port: socks5Port,
+    }));
+    const proxyServer = handler.createServer();
+    await new Promise<void>(resolve => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyAddr = proxyServer.address() as net.AddressInfo;
+
+    const response = await new Promise<{ body: string }>((resolve) => {
+      const socket = net.connect(proxyAddr.port, '127.0.0.1', () => {
+        socket.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n\r\n`);
+      });
+      let data = '';
+      let connected = false;
+      socket.on('data', (chunk: Buffer) => {
+        data += chunk.toString();
+        if (!connected && data.includes('\r\n\r\n')) {
+          connected = true;
+          socket.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n');
+        } else if (connected && data.includes('hello')) {
+          resolve({ body: data });
+        }
+      });
+      socket.on('error', () => resolve({ body: data }));
+      setTimeout(() => { socket.destroy(); resolve({ body: data }); }, 5000);
+    });
+
+    await closeServer(proxyServer);
+    await closeNetServer(socks5Server);
+
+    expect(response.body).toContain('hello');
+  }, 10000);
+
+  it('should handle CONNECT tunnel via SOCKS5 upstream with auth', async () => {
+    const socks5Server = createSocks5Server({
+      requireAuth: true,
+      username: 'socksuser',
+      password: 'sockspass',
+    });
+    await new Promise<void>(resolve => socks5Server.listen(0, '127.0.0.1', resolve));
+    const socks5Port = (socks5Server.address() as net.AddressInfo).port;
+
+    const handler = createTestHandler(new FixedProxyFinder({
+      type: 'socks5' as ProxyType,
+      hostname: '127.0.0.1',
+      port: socks5Port,
+      username: 'socksuser',
+      password: 'sockspass',
+    }));
+    const proxyServer = handler.createServer();
+    await new Promise<void>(resolve => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyAddr = proxyServer.address() as net.AddressInfo;
+
+    const response = await new Promise<{ body: string }>((resolve) => {
+      const socket = net.connect(proxyAddr.port, '127.0.0.1', () => {
+        socket.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n\r\n`);
+      });
+      let data = '';
+      let connected = false;
+      socket.on('data', (chunk: Buffer) => {
+        data += chunk.toString();
+        if (!connected && data.includes('\r\n\r\n')) {
+          connected = true;
+          socket.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n');
+        } else if (connected && data.includes('hello')) {
+          resolve({ body: data });
+        }
+      });
+      socket.on('error', () => resolve({ body: data }));
+      setTimeout(() => { socket.destroy(); resolve({ body: data }); }, 5000);
+    });
+
+    await closeServer(proxyServer);
+    await closeNetServer(socks5Server);
+
+    expect(response.body).toContain('hello');
+  }, 10000);
+
+  it('should return 502 when SOCKS5 upstream rejects CONNECT', async () => {
+    const socks5Server = createSocks5Server({ rejectConnect: true });
+    await new Promise<void>(resolve => socks5Server.listen(0, '127.0.0.1', resolve));
+    const socks5Port = (socks5Server.address() as net.AddressInfo).port;
+
+    const handler = createTestHandler(new FixedProxyFinder({
+      type: 'socks5' as ProxyType,
+      hostname: '127.0.0.1',
+      port: socks5Port,
+    }));
+    const proxyServer = handler.createServer();
+    await new Promise<void>(resolve => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyAddr = proxyServer.address() as net.AddressInfo;
+
+    const response = await new Promise<{ body: string }>((resolve) => {
+      const socket = net.connect(proxyAddr.port, '127.0.0.1', () => {
+        socket.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n\r\n`);
+      });
+      let data = '';
+      socket.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+      socket.on('close', () => resolve({ body: data }));
+      socket.on('error', () => resolve({ body: data }));
+      setTimeout(() => { socket.destroy(); resolve({ body: data }); }, 5000);
+    });
+
+    await closeServer(proxyServer);
+    await closeNetServer(socks5Server);
+
+    // socks5Connect throws on non-zero reply, handler catches and returns 502
+    expect(response.body).toContain('502');
+  }, 10000);
+
+  it('should forward HTTP requests via SOCKS5 upstream', async () => {
+    const socks5Server = createSocks5Server();
+    await new Promise<void>(resolve => socks5Server.listen(0, '127.0.0.1', resolve));
+    const socks5Port = (socks5Server.address() as net.AddressInfo).port;
+
+    const handler = createTestHandler(new FixedProxyFinder({
+      type: 'socks5' as ProxyType,
+      hostname: '127.0.0.1',
+      port: socks5Port,
+    }));
+    const proxyServer = handler.createServer();
+    await new Promise<void>(resolve => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyAddr = proxyServer.address() as net.AddressInfo;
+
+    const response = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = http.get(`http://127.0.0.1:${targetPort}/`, {
+        hostname: '127.0.0.1',
+        port: proxyAddr.port,
+        path: `http://127.0.0.1:${targetPort}/`,
+      }, (res) => {
+        let body = '';
+        res.on('data', (chunk: Buffer) => body += chunk.toString());
+        res.on('end', () => resolve({ status: res.statusCode || 0, body }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+
+    await closeServer(proxyServer);
+    await closeNetServer(socks5Server);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toBe('hello');
+  }, 10000);
+
+  it('should destroy SOCKS5 connection on CONNECT failure and not return to pool', async () => {
+    const socks5Server = createSocks5Server({ rejectConnect: true });
+    await new Promise<void>(resolve => socks5Server.listen(0, '127.0.0.1', resolve));
+    const socks5Port = (socks5Server.address() as net.AddressInfo).port;
+
+    const handler = createTestHandler(new FixedProxyFinder({
+      type: 'socks5' as ProxyType,
+      hostname: '127.0.0.1',
+      port: socks5Port,
+    }));
+    const proxyServer = handler.createServer();
+    await new Promise<void>(resolve => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyAddr = proxyServer.address() as net.AddressInfo;
+
+    // Send CONNECT — should fail
+    await new Promise<void>((resolve) => {
+      const socket = net.connect(proxyAddr.port, '127.0.0.1', () => {
+        socket.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n\r\n`);
+      });
+      socket.on('data', () => {});
+      socket.on('close', resolve);
+      socket.on('error', resolve);
+      setTimeout(() => { socket.destroy(); resolve(); }, 3000);
+    });
+
+    expect((handler as any).connPool.idleCount).toBe(0);
+
+    await closeServer(proxyServer);
+    await closeNetServer(socks5Server);
+  }, 10000);
+ });
 });

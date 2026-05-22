@@ -1,11 +1,14 @@
+export type ProxyType = 'http' | 'socks5' | 'socks4';
+
 export interface Proxy {
+  type: ProxyType;
   hostname: string;
   port: number;
   username?: string;
   password?: string;
 }
 
-export const DirectProxy: Proxy = { hostname: '', port: 0 };
+export const DirectProxy: Proxy = { type: 'http', hostname: '', port: 0 };
 
 export function isDirectProxy(p: Proxy): boolean {
   return p.hostname === '' && p.port === 0;
@@ -24,10 +27,11 @@ export class Proxies {
 
   toString(): string {
     return this.items
-      .map(p => {
-        if (isDirectProxy(p)) return 'DIRECT';
-        const auth = p.username ? `${p.username}:${p.password}@` : '';
-        return `PROXY ${auth}${p.hostname}:${p.port}`;
+    .map(p => {
+      if (isDirectProxy(p)) return 'DIRECT';
+      const auth = p.username ? `${p.username}:${p.password}@` : '';
+      const cmd = p.type === 'socks5' ? 'SOCKS5' : p.type === 'socks4' ? 'SOCKS' : 'PROXY';
+      return `${cmd} ${auth}${p.hostname}:${p.port}`;
       })
       .join('; ');
   }
