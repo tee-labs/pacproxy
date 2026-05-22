@@ -5,6 +5,7 @@ import { ProxyFinder, ProxySelector, Proxies, Proxy, ProxyType, DirectProxy } fr
 import { Logger } from '../logger';
 import { TcpConnectionPool } from './connection-pool';
 import { socks5Connect } from './socks5-protocol';
+import { socks4Connect } from './socks4-protocol';
 type Socket = net.Socket;
 
 /**
@@ -198,9 +199,9 @@ export class ProxyHTTPHandler {
           case 'socks5':
             success = await socks5Connect(serverConn, targetHost, targetPort, username, password);
             break;
-          case 'socks4':
-            // SOCKS4 not yet implemented
-            throw new Error('SOCKS4 upstream proxy is not yet supported');
+   case 'socks4':
+    success = await socks4Connect(serverConn, targetHost, targetPort, username);
+    break;
           case 'http':
           default:
             success = await httpConnect(serverConn, req.url!, username, password);
@@ -312,11 +313,11 @@ export class ProxyHTTPHandler {
       const username = proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined;
       const password = proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined;
 
-      if (proxyType === 'socks5') {
-        // SOCKS5: first establish tunnel, then send HTTP over it
-        await this.doHTTPProxyViaSocks5(req, res, proxyUrl, targetUrl, username, password);
-        return;
-      }
+ if (proxyType === 'socks5' || proxyType === 'socks4') {
+ // SOCKS: first establish tunnel, then send HTTP over it
+ await this.doHTTPProxyViaSocks(req, res, proxyUrl, targetUrl, username, password);
+ return;
+ }
 
       // HTTP proxy: send request to proxy with full URL as path
       options = {
@@ -373,27 +374,32 @@ export class ProxyHTTPHandler {
    * Establishes SOCKS5 CONNECT to the target, then uses http.request
    * with createConnection to reuse the tunnel socket.
    */
-  private async doHTTPProxyViaSocks5(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-    proxyUrl: ProxyURL,
-    targetUrl: URL,
-    username?: string,
-    password?: string,
-  ): Promise<void> {
-    const proxyHost = proxyUrl.hostname;
-    const proxyPort = parseInt(proxyUrl.port, 10) || 1080;
-    const targetHost = targetUrl.hostname;
-    const targetPort = parseInt(targetUrl.port, 10) || 80;
+ private async doHTTPProxyViaSocks(
+ req: http.IncomingMessage,
+ res: http.ServerResponse,
+ proxyUrl: ProxyURL,
+ targetUrl: URL,
+ username?: string,
+ password?: string,
+ ): Promise<void> {
+ const proxyHost = proxyUrl.hostname;
+ const proxyPort = parseInt(proxyUrl.port, 10) || 1080;
+ const targetHost = targetUrl.hostname;
+ const targetPort = parseInt(targetUrl.port, 10) || 80;
+ const proxyType = proxyUrl.proxyType;
 
-    const serverConn = await this.connPool.acquire(proxyHost, proxyPort);
+ const serverConn = await this.connPool.acquire(proxyHost, proxyPort);
 
-    try {
-      await socks5Connect(serverConn, targetHost, targetPort, username, password);
-    } catch (err: any) {
-      serverConn.destroy();
-      throw err;
-    }
+ try {
+ if (proxyType === 'socks5') {
+ await socks5Connect(serverConn, targetHost, targetPort, username, password);
+ } else {
+ await socks4Connect(serverConn, targetHost, targetPort, username);
+ }
+ } catch (err: any) {
+ serverConn.destroy();
+ throw err;
+ }
 
     // Tunnel established — now send HTTP request over it
     const options: http.RequestOptions = {
