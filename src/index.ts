@@ -21,6 +21,7 @@ interface CliOptions {
   logLevel: LogLevel;
   resolve: string;
   watch: boolean;
+  fallback: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -31,6 +32,7 @@ function parseArgs(argv: string[]): CliOptions {
     logLevel: 'INFO',
     resolve: '',
     watch: false,
+    fallback: false,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -61,6 +63,10 @@ function parseArgs(argv: string[]): CliOptions {
       case '--watch':
         opts.watch = true;
         break;
+      case '-f':
+      case '--fallback':
+        opts.fallback = true;
+        break;
       case '-r':
         opts.resolve = argv[++i];
         break;
@@ -86,8 +92,9 @@ function printUsage(): void {
   console.log('  -l string      Interface and port to listen on (default "127.0.0.1:8080")');
   console.log('  -r string      Resolve the proxies for the provided url to STDOUT and exit');
   console.log('  -v             Enable verbose output (INFO level, use --log-level for more control)');
-  console.log('  -L, --log-level <level>  Set log level: debug, info, warn, error (default: info)');
-  console.log('  -w, --watch    Watch PAC file for changes and auto-reload');
+  console.log(' -L, --log-level <level> Set log level: debug, info, warn, error (default: info)');
+  console.log(' -w, --watch Watch PAC file for changes and auto-reload');
+  console.log(' -f, --fallback Enable PAC fallback chain (try next proxy on failure)');
 }
 
 function main(): void {
@@ -116,7 +123,7 @@ function main(): void {
     return;
   }
 
-  startServer(engine, opts.listen, logger);
+  startServer(engine, opts.listen, logger, opts.fallback);
 
   if (opts.watch) {
     const watcher = setupFileWatcher(opts.pac, engine, logger);
@@ -148,9 +155,9 @@ function doResolve(engine: OttoEngine, resolveUrl: string, logger: Logger): void
   }
 }
 
-function startServer(engine: OttoEngine, listenAddr: string, logger: Logger): void {
-    const selector = new FirstItemSelector();
-    const proxyHandler = new ProxyHTTPHandler(engine, selector, undefined, logger ? true : false, logger);
+function startServer(engine: OttoEngine, listenAddr: string, logger: Logger, fallback: boolean): void {
+  const selector = new FirstItemSelector();
+  const proxyHandler = new ProxyHTTPHandler(engine, selector, undefined, logger ? true : false, logger, fallback);
 
     const [host, portStr] = listenAddr.includes(':')
       ? listenAddr.split(':')
