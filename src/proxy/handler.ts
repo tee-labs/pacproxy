@@ -1,7 +1,7 @@
 import * as http from 'http';
 import * as net from 'net';
 import { URL } from 'url';
-import { ProxyFinder, ProxySelector, Proxies, Proxy, ProxyType, DirectProxy } from '../pac/types';
+import { ProxyFinder, ProxySelector, Proxies, Proxy, ProxyType, DirectProxy, isDirectProxy } from '../pac/types';
 import { Logger } from '../logger';
 import { TcpConnectionPool } from './connection-pool';
 import { socks5Connect } from './socks5-protocol';
@@ -84,11 +84,59 @@ interface ProxyURL extends URL {
   proxyType: ProxyType;
 }
 
+/**
+ * Convert a Proxy object to a ProxyURL (or null for DIRECT).
+ */
+function proxyToURL(proxy: Proxy, req: http.IncomingMessage): ProxyURL | null {
+  if (isDirectProxy(proxy)) {
+    return null;
+  }
+
+  const proxyUrl = new URL(`http://${proxy.hostname}:${proxy.port}`) as ProxyURL;
+  proxyUrl.proxyType = proxy.type;
+
+  // Priority 1: PAC file auth (from proxy object)
+  if (proxy.username) {
+    proxyUrl.username = proxy.username;
+    if (proxy.password) {
+      proxyUrl.password = proxy.password;
+    }
+  }
+  // Priority 2: Environment variable fallback
+  else if (process.env.PROXY_USER) {
+    proxyUrl.username = process.env.PROXY_USER;
+    proxyUrl.password = process.env.PROXY_PASS || '';
+  }
+  // Priority 3: Client request header
+  const proxyAuth = req.headers['proxy-authorization'];
+  if (proxyAuth) {
+    const parsed = parseBasicAuth(proxyAuth);
+    if (parsed) {
+      proxyUrl.username = parsed.username;
+      proxyUrl.password = parsed.password;
+    }
+  }
+
+  return proxyUrl;
+}
+
+/**
+ * Error class for proxy failures that should trigger fallback retry.
+ * Connection errors, timeout, and non-2xx CONNECT responses are retryable.
+ */
+export class ProxyFailureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProxyFailureError';
+  }
+}
+
 export class ProxyHTTPHandler {
   private readonly httpClient: http.Agent;
   private readonly nonProxyHandler: http.RequestListener;
   private readonly logger: Logger;
   private readonly connPool: TcpConnectionPool;
+  private readonly fallback: boolean;
 
   constructor(
     private readonly proxyFinder: ProxyFinder,
@@ -96,9 +144,11 @@ export class ProxyHTTPHandler {
     nonProxyHandler?: http.RequestListener,
     private readonly verbose: boolean = false,
     private readonly extLogger?: Logger,
+    fallback: boolean = false,
   ) {
     this.logger = extLogger ?? new Logger(verbose);
     this.connPool = new TcpConnectionPool({}, this.logger);
+    this.fallback = fallback;
     this.httpClient = new http.Agent({
       keepAlive: true,
       maxSockets: 50,
@@ -143,15 +193,22 @@ export class ProxyHTTPHandler {
       const startTime = Date.now();
 
       try {
-        const proxyUrl = await this.lookupProxy(req);
         const targetUrl = new URL(req.url);
-        const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
+        const proxies = await this.proxyFinder.findProxyForURL(targetUrl);
 
-        reqLogger.proxyResolution(req.method || 'GET', targetUrl.host, targetUrl.pathname, proxy);
-        await this.doHTTPProxy(req, res, proxyUrl);
+        if (this.fallback && proxies.length > 1) {
+          // Fallback mode: try each proxy in order
+          await this.doHTTPProxyWithFallback(req, res, proxies, reqLogger);
+        } else {
+          // Single-proxy mode (no fallback or only one proxy)
+          const proxyUrl = this.lookupProxyFromList(req, proxies);
+          const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
+          reqLogger.proxyResolution(req.method || 'GET', targetUrl.host, targetUrl.pathname, proxy);
+          await this.doHTTPProxy(req, res, proxyUrl);
+        }
 
         const duration = Date.now() - startTime;
-        reqLogger.debug(`${req.method} ${targetUrl.host}${targetUrl.pathname} completed in ${duration}ms via ${proxy}`);
+        reqLogger.debug(`${req.method} ${targetUrl.host}${targetUrl.pathname} completed in ${duration}ms`);
       } catch (err: any) {
         const duration = Date.now() - startTime;
         reqLogger.error(`${req.method} ${req.url} failed after ${duration}ms:`, err);
@@ -167,78 +224,189 @@ export class ProxyHTTPHandler {
     }
   }
 
+  /**
+   * Try each proxy in the PAC chain for HTTP requests.
+   * On connection error (ECONNREFUSED, ETIMEDOUT, etc.), move to the next proxy.
+   * Always buffers the request body first to enable replay on retry.
+   */
+  private async doHTTPProxyWithFallback(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    proxies: Proxies,
+    reqLogger: Logger,
+  ): Promise<void> {
+    const proxyList = proxies.toArray();
+    let lastError: Error | null = null;
+
+    // Always buffer the request body upfront for potential retry.
+    const bodyBuffer = await bufferRequest(req);
+
+    for (let i = 0; i < proxyList.length; i++) {
+      const proxyUrl = proxyToURL(proxyList[i], req);
+      const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
+      const targetUrl = new URL(req.url!);
+      reqLogger.proxyResolution(req.method || 'GET', targetUrl.host, targetUrl.pathname, proxy);
+
+      try {
+        await this.doHTTPProxyRetry(res, proxyUrl, req, bodyBuffer);
+        return;
+      } catch (err: any) {
+        if (isRetryableHTTPError(err) && i < proxyList.length - 1) {
+          reqLogger.warn(`Proxy ${proxy} failed for ${req.url}: ${err.message}, trying next...`);
+          lastError = err;
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    throw lastError;
+  }
+
+  /**
+   * Retry attempt: replay cached body buffer to the proxy.
+   * Rejects on connection error OR 5xx response from the upstream proxy
+   * (5xx indicates the proxy is alive but can't fulfill the request, which is also fallback-worthy).
+   */
+  private doHTTPProxyRetry(
+    res: http.ServerResponse,
+    proxyUrl: ProxyURL | null,
+    origReq: http.IncomingMessage,
+    bodyBuffer: Buffer,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const options = this.buildHTTPOptions(origReq, proxyUrl);
+
+      const proxyReq = http.request(options, (proxyRes) => {
+        const statusCode = proxyRes.statusCode || 0;
+        if (statusCode >= 500 && statusCode < 600) {
+          // Upstream proxy returned 5xx — consume the response body and reject
+          // so the fallback loop can try the next proxy.
+          const chunks: Buffer[] = [];
+          proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+          proxyRes.on('end', () => {
+            const err: any = new Error(`Upstream returned ${statusCode}`);
+            err.code = 'EUPSTREAM5XX';
+            err.statusCode = statusCode;
+            reject(err);
+          });
+          return;
+        }
+
+        this.forwardResponse(res, proxyRes);
+        proxyRes.on('end', resolve);
+        proxyRes.on('error', reject);
+      });
+
+      proxyReq.on('error', (err: any) => {
+        if (!res.headersSent) {
+          reject(err);
+        } else {
+          res.end();
+          reject(err);
+        }
+      });
+
+      if (bodyBuffer.length > 0) {
+        proxyReq.write(bodyBuffer);
+      }
+      proxyReq.end();
+    });
+  }
+
+  /**
+   * Build http.RequestOptions for the given request and proxy URL.
+   */
+  private buildHTTPOptions(req: http.IncomingMessage, proxyUrl?: ProxyURL | null): http.RequestOptions {
+    removeProxyHeaders(req);
+    const targetUrl = new URL(req.url!);
+
+    let options: http.RequestOptions;
+    if (proxyUrl) {
+      const proxyType = proxyUrl.proxyType;
+      if (proxyType === 'socks5' || proxyType === 'socks4') {
+        // For SOCKS in fallback mode, fall through to HTTP handling
+        // (SOCKS fallback for HTTP is a future enhancement)
+      }
+
+      options = {
+        hostname: proxyUrl.hostname,
+        port: parseInt(proxyUrl.port, 10) || 3128,
+        path: req.url,
+        method: req.method,
+        headers: { ...req.headers },
+        agent: this.httpClient,
+      };
+
+      if (proxyUrl.username) {
+        const auth = Buffer.from(`${proxyUrl.username}:${proxyUrl.password || ''}`).toString('base64');
+        const headers = options.headers as Record<string, string | string[]>;
+        headers['proxy-authorization'] = `Basic ${auth}`;
+      }
+    } else {
+      options = {
+        hostname: targetUrl.hostname,
+        port: parseInt(targetUrl.port, 10) || 80,
+        path: targetUrl.pathname + targetUrl.search,
+        method: req.method,
+        headers: { ...req.headers },
+        agent: this.httpClient,
+      };
+    }
+
+    const headers = options.headers as Record<string, any>;
+    delete headers['proxy-connection'];
+    delete headers['proxy-authorization'];
+
+    return options;
+  }
+
+  /**
+   * Forward the upstream response to the client response.
+   */
+  private forwardResponse(res: http.ServerResponse, proxyRes: http.IncomingMessage): void {
+    for (const key of res.getHeaderNames()) {
+      res.removeHeader(key);
+    }
+    copyHeaders(res, proxyRes.headers);
+    res.writeHead(proxyRes.statusCode || 200);
+    proxyRes.pipe(res);
+  }
+
   private async handleConnect(req: http.IncomingMessage, clientSocket: Socket, head: Buffer): Promise<void> {
     let serverConn: net.Socket | null = null;
     const reqId = this.logger.nextRequestId();
     const reqLogger = this.logger.withRequestId(reqId);
     const startTime = Date.now();
 
+    const targetHostPort = req.url!;
+    const colonIdx = targetHostPort.lastIndexOf(':');
+    const targetHost = targetHostPort.substring(0, colonIdx);
+    const targetPort = parseInt(targetHostPort.substring(colonIdx + 1), 10) || 443;
+
     try {
-      const proxyUrl = await this.lookupProxy(req);
-      const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
-      reqLogger.connectTunnel(req.url || 'unknown', proxy);
+      const proxies = await this.proxyFinder.findProxyForURL(new URL(`http://${req.url}`));
 
-      const targetHostPort = req.url!;
-      const colonIdx = targetHostPort.lastIndexOf(':');
-      const targetHost = targetHostPort.substring(0, colonIdx);
-      const targetPort = parseInt(targetHostPort.substring(colonIdx + 1), 10) || 443;
-
-      if (proxyUrl) {
-        // —— 走上游代理 ——
-        const proxyHost = proxyUrl.hostname;
-        const proxyPort = parseInt(proxyUrl.port, 10) || 3128;
-        const proxyType = proxyUrl.proxyType;
-        const username = proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined;
-        const password = proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined;
-
-        serverConn = await this.connPool.acquire(proxyHost, proxyPort);
-        reqLogger.debug(`Acquired TCP connection to upstream proxy ${proxyHost}:${proxyPort} (type=${proxyType})`);
-
-        let success: boolean;
-        switch (proxyType) {
-          case 'socks5':
-            success = await socks5Connect(serverConn, targetHost, targetPort, username, password);
-            break;
-   case 'socks4':
-    success = await socks4Connect(serverConn, targetHost, targetPort, username);
-    break;
-          case 'http':
-          default:
-            success = await httpConnect(serverConn, req.url!, username, password);
-            break;
-        }
-
-        if (!success) {
-          // Non-2xx response — upstream proxy rejected CONNECT
-          // Destroy the TCP connection rather than returning to pool
-          serverConn.destroy();
-          serverConn = null;
-          reqLogger.warn(`Upstream proxy rejected CONNECT for ${req.url}`);
-          clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-          clientSocket.destroy();
-          return;
-        }
-
-        // 2xx — notify client that tunnel is established, then pipe
-        reqLogger.debug('Upstream proxy granted CONNECT tunnel');
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head.length > 0) {
-          serverConn.write(head);
-        }
+      if (this.fallback && proxies.length > 1) {
+        // Fallback mode: try each proxy in order for CONNECT
+        const result = await this.doConnectWithFallback(req, clientSocket, head, proxies, reqLogger, targetHost, targetPort);
+        serverConn = result;
       } else {
-        // —— 直连目标 ——
-        serverConn = await tcpConnect(targetHost, targetPort);
-        reqLogger.debug(`TCP connection established to target ${targetHost}:${targetPort}`);
-
-        clientSocket.write('HTTP/1.0 200 OK\r\n\r\n');
-        if (head.length > 0) {
-          serverConn.write(head);
-        }
+        // Single-proxy mode
+        const proxyUrl = this.lookupProxyFromList(req, proxies);
+        const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
+        reqLogger.connectTunnel(req.url || 'unknown', proxy);
+        serverConn = await this.doConnectProxy(proxyUrl, req.url!, clientSocket, head, reqLogger, targetHost, targetPort);
       }
 
-      // 建立双向数据管道
-      serverConn!.pipe(clientSocket);
-      clientSocket.pipe(serverConn!);
+      // Tunnel established — set up bidirectional pipe
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head.length > 0) {
+        serverConn.write(head);
+      }
+
+      serverConn.pipe(clientSocket);
+      clientSocket.pipe(serverConn);
 
       const cleanup = () => {
         if (serverConn && !serverConn.destroyed) serverConn.destroy();
@@ -247,9 +415,9 @@ export class ProxyHTTPHandler {
         reqLogger.debug(`CONNECT tunnel ${req.url} closed after ${duration}ms`);
       };
 
-      serverConn!.on('close', cleanup);
+      serverConn.on('close', cleanup);
       clientSocket.on('close', cleanup);
-      serverConn!.on('error', cleanup);
+      serverConn.on('error', cleanup);
       clientSocket.on('error', cleanup);
     } catch (err: any) {
       const duration = Date.now() - startTime;
@@ -262,43 +430,119 @@ export class ProxyHTTPHandler {
     }
   }
 
+  /**
+   * Try each proxy in the PAC chain for CONNECT tunnels.
+   * On proxy rejection (non-2xx) or connection error, try the next proxy.
+   * Returns the established server connection on success.
+   */
+  private async doConnectWithFallback(
+    req: http.IncomingMessage,
+    clientSocket: Socket,
+    head: Buffer,
+    proxies: Proxies,
+    reqLogger: Logger,
+    targetHost: string,
+    targetPort: number,
+  ): Promise<net.Socket> {
+    const proxyList = proxies.toArray();
+    let lastError: Error | null = null;
+
+    for (let i = 0; i < proxyList.length; i++) {
+      const proxyUrl = proxyToURL(proxyList[i], req);
+      const proxy = proxyUrl ? `${proxyUrl.hostname}:${proxyUrl.port}` : 'DIRECT';
+      reqLogger.connectTunnel(req.url || 'unknown', proxy);
+
+      try {
+        return await this.doConnectProxy(proxyUrl, req.url!, clientSocket, head, reqLogger, targetHost, targetPort);
+      } catch (err: any) {
+        if (i < proxyList.length - 1) {
+          // More proxies to try
+          reqLogger.warn(`CONNECT proxy ${proxy} failed for ${req.url}: ${err.message}, trying next...`);
+          lastError = err;
+          continue;
+        }
+        // Last proxy — rethrow
+        throw err;
+      }
+    }
+
+    throw lastError ?? new Error('All proxies failed');
+  }
+
+  /**
+   * Attempt a single CONNECT through a proxy (or DIRECT).
+   * Returns the server connection on success, throws on failure.
+   */
+  private async doConnectProxy(
+    proxyUrl: ProxyURL | null,
+    target: string,
+    _clientSocket: Socket,
+    _head: Buffer,
+    reqLogger: Logger,
+    targetHost: string,
+    targetPort: number,
+  ): Promise<net.Socket> {
+    let serverConn: net.Socket | null = null;
+
+    if (proxyUrl) {
+      const proxyHost = proxyUrl.hostname;
+      const proxyPort = parseInt(proxyUrl.port, 10) || 3128;
+      const proxyType = proxyUrl.proxyType;
+      const username = proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined;
+      const password = proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined;
+
+      serverConn = await this.connPool.acquire(proxyHost, proxyPort);
+      reqLogger.debug(`Acquired TCP connection to upstream proxy ${proxyHost}:${proxyPort} (type=${proxyType})`);
+
+      let success: boolean;
+      switch (proxyType) {
+        case 'socks5':
+          success = await socks5Connect(serverConn, targetHost, targetPort, username, password);
+          break;
+        case 'socks4':
+          success = await socks4Connect(serverConn, targetHost, targetPort, username);
+          break;
+        case 'http':
+        default:
+          success = await httpConnect(serverConn, target, username, password);
+          break;
+      }
+
+      if (!success) {
+        serverConn.destroy();
+        reqLogger.warn(`Upstream proxy rejected CONNECT for ${target}`);
+        throw new ProxyFailureError(`Upstream proxy ${proxyHost}:${proxyPort} rejected CONNECT for ${target}`);
+      }
+
+      reqLogger.debug('Upstream proxy granted CONNECT tunnel');
+    } else {
+      // Direct connection
+      serverConn = await tcpConnect(targetHost, targetPort);
+      reqLogger.debug(`TCP connection established to target ${targetHost}:${targetPort}`);
+    }
+
+    return serverConn;
+  }
+
+  /**
+   * Look up a single proxy from the Proxies list using the selector.
+   * Used in non-fallback mode.
+   */
+  private lookupProxyFromList(req: http.IncomingMessage, proxies: Proxies): ProxyURL | null {
+    const proxy = this.proxySelector.selectProxy(proxies);
+    return proxyToURL(proxy, req);
+  }
+
+  /**
+   * Legacy lookup method — selects a single proxy via selector + auth resolution.
+   * Used in non-fallback mode.
+   */
   private async lookupProxy(req: http.IncomingMessage): Promise<ProxyURL | null> {
     const urlStr = req.url!;
     const fullUrl = urlStr.startsWith('http') ? urlStr : `http://${urlStr}`;
     const targetUrl = new URL(fullUrl);
     const proxies = await this.proxyFinder.findProxyForURL(targetUrl);
-    const proxy = this.proxySelector.selectProxy(proxies);
-
-    if (proxy.hostname === '' && proxy.port === 0) {
-      return null;
-    }
-
-    const proxyUrl = new URL(`http://${proxy.hostname}:${proxy.port}`) as ProxyURL;
-    proxyUrl.proxyType = proxy.type;
-
-    // Priority 1: PAC file auth (from proxy object)
-    if (proxy.username) {
-      proxyUrl.username = proxy.username;
-      if (proxy.password) {
-        proxyUrl.password = proxy.password;
-      }
-    }
-    // Priority 2: Environment variable fallback
-    else if (process.env.PROXY_USER) {
-      proxyUrl.username = process.env.PROXY_USER;
-      proxyUrl.password = process.env.PROXY_PASS || '';
-    }
-    // Priority 3: Client request header
-    const proxyAuth = req.headers['proxy-authorization'];
-    if (proxyAuth) {
-      const parsed = parseBasicAuth(proxyAuth);
-      if (parsed) {
-        proxyUrl.username = parsed.username;
-        proxyUrl.password = parsed.password;
-      }
-    }
-
-    return proxyUrl;
+    return this.lookupProxyFromList(req, proxies);
   }
 
   private async doHTTPProxy(req: http.IncomingMessage, res: http.ServerResponse, proxyUrl?: ProxyURL | null): Promise<void> {
@@ -313,11 +557,11 @@ export class ProxyHTTPHandler {
       const username = proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined;
       const password = proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined;
 
- if (proxyType === 'socks5' || proxyType === 'socks4') {
- // SOCKS: first establish tunnel, then send HTTP over it
- await this.doHTTPProxyViaSocks(req, res, proxyUrl, targetUrl, username, password);
- return;
- }
+      if (proxyType === 'socks5' || proxyType === 'socks4') {
+        // SOCKS: first establish tunnel, then send HTTP over it
+        await this.doHTTPProxyViaSocks(req, res, proxyUrl, targetUrl, username, password);
+        return;
+      }
 
       // HTTP proxy: send request to proxy with full URL as path
       options = {
@@ -374,32 +618,32 @@ export class ProxyHTTPHandler {
    * Establishes SOCKS5 CONNECT to the target, then uses http.request
    * with createConnection to reuse the tunnel socket.
    */
- private async doHTTPProxyViaSocks(
- req: http.IncomingMessage,
- res: http.ServerResponse,
- proxyUrl: ProxyURL,
- targetUrl: URL,
- username?: string,
- password?: string,
- ): Promise<void> {
- const proxyHost = proxyUrl.hostname;
- const proxyPort = parseInt(proxyUrl.port, 10) || 1080;
- const targetHost = targetUrl.hostname;
- const targetPort = parseInt(targetUrl.port, 10) || 80;
- const proxyType = proxyUrl.proxyType;
+  private async doHTTPProxyViaSocks(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    proxyUrl: ProxyURL,
+    targetUrl: URL,
+    username?: string,
+    password?: string,
+  ): Promise<void> {
+    const proxyHost = proxyUrl.hostname;
+    const proxyPort = parseInt(proxyUrl.port, 10) || 1080;
+    const targetHost = targetUrl.hostname;
+    const targetPort = parseInt(targetUrl.port, 10) || 80;
+    const proxyType = proxyUrl.proxyType;
 
- const serverConn = await this.connPool.acquire(proxyHost, proxyPort);
+    const serverConn = await this.connPool.acquire(proxyHost, proxyPort);
 
- try {
- if (proxyType === 'socks5') {
- await socks5Connect(serverConn, targetHost, targetPort, username, password);
- } else {
- await socks4Connect(serverConn, targetHost, targetPort, username);
- }
- } catch (err: any) {
- serverConn.destroy();
- throw err;
- }
+    try {
+      if (proxyType === 'socks5') {
+        await socks5Connect(serverConn, targetHost, targetPort, username, password);
+      } else {
+        await socks4Connect(serverConn, targetHost, targetPort, username);
+      }
+    } catch (err: any) {
+      serverConn.destroy();
+      throw err;
+    }
 
     // Tunnel established — now send HTTP request over it
     const options: http.RequestOptions = {
@@ -436,6 +680,41 @@ export class ProxyHTTPHandler {
 
     req.pipe(proxyReq);
   }
+}
+
+/**
+ * Buffer the entire request body into a single Buffer.
+ * Used in fallback mode to enable replaying the request on proxy retry.
+ */
+function bufferRequest(req: http.IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/**
+ * Determine if an HTTP proxy error is retryable (should trigger fallback).
+ * Connection refused, timeout, and reset errors are retryable.
+ * Errors after headers are already sent to the client are NOT retryable.
+ */
+function isRetryableHTTPError(err: Error): boolean {
+  const code = (err as any).code;
+  // Node.js connection error codes
+  if (['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'EAI_AGAIN'].includes(code)) {
+    return true;
+  }
+  // ProxyFailureError (from CONNECT rejection)
+  if (err instanceof ProxyFailureError) {
+    return true;
+  }
+  // Upstream proxy returned 5xx
+  if (code === 'EUPSTREAM5XX') {
+    return true;
+  }
+  return false;
 }
 
 function tcpConnect(host: string, port: number): Promise<net.Socket> {
