@@ -1,9 +1,11 @@
 import * as http from 'http';
 import * as net from 'net';
 import { URL } from 'url';
-import { ProxyFinder, ProxySelector, Proxies, Proxy, DirectProxy } from '../pac/types';
+import { ProxyFinder, ProxySelector, Proxies, Proxy, ProxyType, DirectProxy } from '../pac/types';
 import { Logger } from '../logger';
 import { TcpConnectionPool } from './connection-pool';
+import { socks5Connect } from './socks5-protocol';
+import { socks4Connect } from './socks4-protocol';
 type Socket = net.Socket;
 
 /**
@@ -50,6 +52,36 @@ function readConnectResponse(socket: net.Socket, timeoutMs = 10000): Promise<boo
     socket.on('error', onError);
     socket.on('close', onClose);
   });
+}
+
+/**
+ * Perform HTTP CONNECT handshake on an established TCP connection.
+ */
+async function httpConnect(
+  socket: net.Socket,
+  target: string,
+  username?: string,
+  password?: string,
+): Promise<boolean> {
+  const lines = [
+    `CONNECT ${target} HTTP/1.1`,
+    `Host: ${target}`,
+  ];
+  if (username) {
+    const auth = Buffer.from(`${username}:${password || ''}`).toString('base64');
+    lines.push(`Proxy-Authorization: Basic ${auth}`);
+  }
+  lines.push('', '');
+  socket.write(lines.join('\r\n'));
+  return readConnectResponse(socket);
+}
+
+/**
+ * Extended URL with proxy type information attached.
+ * Avoids breaking the existing URL-based interface while carrying type.
+ */
+interface ProxyURL extends URL {
+  proxyType: ProxyType;
 }
 
 export class ProxyHTTPHandler {
@@ -148,34 +180,37 @@ export class ProxyHTTPHandler {
 
       const targetHostPort = req.url!;
       const colonIdx = targetHostPort.lastIndexOf(':');
+      const targetHost = targetHostPort.substring(0, colonIdx);
+      const targetPort = parseInt(targetHostPort.substring(colonIdx + 1), 10) || 443;
 
       if (proxyUrl) {
         // —— 走上游代理 ——
         const proxyHost = proxyUrl.hostname;
         const proxyPort = parseInt(proxyUrl.port, 10) || 3128;
+        const proxyType = proxyUrl.proxyType;
+        const username = proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined;
+        const password = proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined;
 
         serverConn = await this.connPool.acquire(proxyHost, proxyPort);
-        reqLogger.debug(`Acquired TCP connection to upstream proxy ${proxyHost}:${proxyPort}`);
+        reqLogger.debug(`Acquired TCP connection to upstream proxy ${proxyHost}:${proxyPort} (type=${proxyType})`);
 
-        // 构建 CONNECT 请求
-        const connectReqLines = [
-          `CONNECT ${req.url} HTTP/1.1`,
-          `Host: ${req.url}`,
-        ];
-        if (proxyUrl.username) {
-          const auth = Buffer.from(`${proxyUrl.username}:${proxyUrl.password || ''}`).toString('base64');
-          connectReqLines.push(`Proxy-Authorization: Basic ${auth}`);
-          reqLogger.debug('Sending Proxy-Authorization for upstream proxy');
+        let success: boolean;
+        switch (proxyType) {
+          case 'socks5':
+            success = await socks5Connect(serverConn, targetHost, targetPort, username, password);
+            break;
+   case 'socks4':
+    success = await socks4Connect(serverConn, targetHost, targetPort, username);
+    break;
+          case 'http':
+          default:
+            success = await httpConnect(serverConn, req.url!, username, password);
+            break;
         }
-        connectReqLines.push('', '');
-        serverConn.write(connectReqLines.join('\r\n'));
 
-        // 读取上游代理的 CONNECT 响应
-        const success = await readConnectResponse(serverConn);
         if (!success) {
-          // 非 2xx 响应 — 上游代理拒绝 CONNECT
-          // 销毁 TCP 连接而非放回池：某些企业代理（如 Pinacolada）不允许在
-          // 同一个 TCP 连接上重复发送 CONNECT，放回池复用会导致连续失败
+          // Non-2xx response — upstream proxy rejected CONNECT
+          // Destroy the TCP connection rather than returning to pool
           serverConn.destroy();
           serverConn = null;
           reqLogger.warn(`Upstream proxy rejected CONNECT for ${req.url}`);
@@ -184,7 +219,7 @@ export class ProxyHTTPHandler {
           return;
         }
 
-        // 2xx — 通知客户端隧道已建立，然后透传上游剩余数据
+        // 2xx — notify client that tunnel is established, then pipe
         reqLogger.debug('Upstream proxy granted CONNECT tunnel');
         clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (head.length > 0) {
@@ -192,9 +227,6 @@ export class ProxyHTTPHandler {
         }
       } else {
         // —— 直连目标 ——
-        const targetHost = targetHostPort.substring(0, colonIdx);
-        const targetPort = parseInt(targetHostPort.substring(colonIdx + 1), 10) || 443;
-
         serverConn = await tcpConnect(targetHost, targetPort);
         reqLogger.debug(`TCP connection established to target ${targetHost}:${targetPort}`);
 
@@ -205,8 +237,8 @@ export class ProxyHTTPHandler {
       }
 
       // 建立双向数据管道
-      serverConn.pipe(clientSocket);
-      clientSocket.pipe(serverConn);
+      serverConn!.pipe(clientSocket);
+      clientSocket.pipe(serverConn!);
 
       const cleanup = () => {
         if (serverConn && !serverConn.destroyed) serverConn.destroy();
@@ -215,9 +247,9 @@ export class ProxyHTTPHandler {
         reqLogger.debug(`CONNECT tunnel ${req.url} closed after ${duration}ms`);
       };
 
-      serverConn.on('close', cleanup);
+      serverConn!.on('close', cleanup);
       clientSocket.on('close', cleanup);
-      serverConn.on('error', cleanup);
+      serverConn!.on('error', cleanup);
       clientSocket.on('error', cleanup);
     } catch (err: any) {
       const duration = Date.now() - startTime;
@@ -230,7 +262,7 @@ export class ProxyHTTPHandler {
     }
   }
 
-  private async lookupProxy(req: http.IncomingMessage): Promise<URL | null> {
+  private async lookupProxy(req: http.IncomingMessage): Promise<ProxyURL | null> {
     const urlStr = req.url!;
     const fullUrl = urlStr.startsWith('http') ? urlStr : `http://${urlStr}`;
     const targetUrl = new URL(fullUrl);
@@ -241,7 +273,9 @@ export class ProxyHTTPHandler {
       return null;
     }
 
-    const proxyUrl = new URL(`http://${proxy.hostname}:${proxy.port}`);
+    const proxyUrl = new URL(`http://${proxy.hostname}:${proxy.port}`) as ProxyURL;
+    proxyUrl.proxyType = proxy.type;
+
     // Priority 1: PAC file auth (from proxy object)
     if (proxy.username) {
       proxyUrl.username = proxy.username;
@@ -267,7 +301,7 @@ export class ProxyHTTPHandler {
     return proxyUrl;
   }
 
-  private async doHTTPProxy(req: http.IncomingMessage, res: http.ServerResponse, proxyUrl?: URL | null): Promise<void> {
+  private async doHTTPProxy(req: http.IncomingMessage, res: http.ServerResponse, proxyUrl?: ProxyURL | null): Promise<void> {
     removeProxyHeaders(req);
 
     const targetUrl = new URL(req.url!);
@@ -275,7 +309,17 @@ export class ProxyHTTPHandler {
     let options: http.RequestOptions;
 
     if (proxyUrl) {
-      // 通过上游代理转发：请求发到代理，path 设完整 URL
+      const proxyType = proxyUrl.proxyType;
+      const username = proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined;
+      const password = proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined;
+
+ if (proxyType === 'socks5' || proxyType === 'socks4') {
+ // SOCKS: first establish tunnel, then send HTTP over it
+ await this.doHTTPProxyViaSocks(req, res, proxyUrl, targetUrl, username, password);
+ return;
+ }
+
+      // HTTP proxy: send request to proxy with full URL as path
       options = {
         hostname: proxyUrl.hostname,
         port: parseInt(proxyUrl.port, 10) || 3128,
@@ -284,6 +328,12 @@ export class ProxyHTTPHandler {
         headers: req.headers,
         agent: this.httpClient,
       };
+
+      if (proxyUrl.username) {
+        const auth = Buffer.from(`${proxyUrl.username}:${proxyUrl.password || ''}`).toString('base64');
+        const headers = options.headers as Record<string, string | string[]>;
+        headers['proxy-authorization'] = `Basic ${auth}`;
+      }
     } else {
       // 直连目标
       options = {
@@ -310,6 +360,74 @@ export class ProxyHTTPHandler {
     });
 
     proxyReq.on('error', (err) => {
+      if (!res.headersSent) {
+        res.writeHead(502);
+        res.end(err.message || 'Bad Gateway');
+      }
+    });
+
+    req.pipe(proxyReq);
+  }
+
+  /**
+   * Send HTTP request over a SOCKS5 tunnel.
+   * Establishes SOCKS5 CONNECT to the target, then uses http.request
+   * with createConnection to reuse the tunnel socket.
+   */
+ private async doHTTPProxyViaSocks(
+ req: http.IncomingMessage,
+ res: http.ServerResponse,
+ proxyUrl: ProxyURL,
+ targetUrl: URL,
+ username?: string,
+ password?: string,
+ ): Promise<void> {
+ const proxyHost = proxyUrl.hostname;
+ const proxyPort = parseInt(proxyUrl.port, 10) || 1080;
+ const targetHost = targetUrl.hostname;
+ const targetPort = parseInt(targetUrl.port, 10) || 80;
+ const proxyType = proxyUrl.proxyType;
+
+ const serverConn = await this.connPool.acquire(proxyHost, proxyPort);
+
+ try {
+ if (proxyType === 'socks5') {
+ await socks5Connect(serverConn, targetHost, targetPort, username, password);
+ } else {
+ await socks4Connect(serverConn, targetHost, targetPort, username);
+ }
+ } catch (err: any) {
+ serverConn.destroy();
+ throw err;
+ }
+
+    // Tunnel established — now send HTTP request over it
+    const options: http.RequestOptions = {
+      hostname: targetUrl.hostname,
+      port: targetPort,
+      path: targetUrl.pathname + targetUrl.search,
+      method: req.method,
+      headers: { ...req.headers },
+      createConnection: () => serverConn,
+    };
+
+    // Remove hop-by-hop headers
+    const headers = options.headers as Record<string, any>;
+    delete headers['proxy-connection'];
+    delete headers['proxy-authorization'];
+    delete headers['connection'];
+
+    const proxyReq = http.request(options, (proxyRes) => {
+      for (const key of res.getHeaderNames()) {
+        res.removeHeader(key);
+      }
+      copyHeaders(res, proxyRes.headers);
+      res.writeHead(proxyRes.statusCode || 200);
+      proxyRes.pipe(res);
+    });
+
+    proxyReq.on('error', (err) => {
+      if (serverConn && !serverConn.destroyed) serverConn.destroy();
       if (!res.headersSent) {
         res.writeHead(502);
         res.end(err.message || 'Bad Gateway');
