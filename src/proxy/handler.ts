@@ -405,9 +405,7 @@ export class ProxyHTTPHandler {
         serverConn.write(head);
       }
 
-      serverConn.pipe(clientSocket);
-      clientSocket.pipe(serverConn);
-
+      // 先注册 error/close handler，再建立管道，避免竞态导致 unhandled error
       const cleanup = () => {
         if (serverConn && !serverConn.destroyed) serverConn.destroy();
         if (!clientSocket.destroyed) clientSocket.destroy();
@@ -415,10 +413,13 @@ export class ProxyHTTPHandler {
         reqLogger.debug(`CONNECT tunnel ${req.url} closed after ${duration}ms`);
       };
 
-      serverConn.on('close', cleanup);
-      clientSocket.on('close', cleanup);
-      serverConn.on('error', cleanup);
+      serverConn!.on('error', cleanup);
       clientSocket.on('error', cleanup);
+      serverConn!.on('close', cleanup);
+      clientSocket.on('close', cleanup);
+
+      serverConn!.pipe(clientSocket);
+      clientSocket.pipe(serverConn!);
     } catch (err: any) {
       const duration = Date.now() - startTime;
       reqLogger.error(`CONNECT ${req.url} failed after ${duration}ms:`, err);
