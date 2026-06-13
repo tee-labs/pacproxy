@@ -170,9 +170,15 @@ export class ProxyHTTPHandler {
     });
 
     server.on('connect', (req, clientSocket, head) => {
-      this.handleConnect(req, clientSocket as Socket, head).catch((err) => {
+      const sock = clientSocket as Socket;
+      // Guard against client disconnecting during async proxy resolution.
+      // Without this, ECONNRESET on clientSocket is unhandled and crashes the process.
+      sock.on('error', (err: Error) => {
+        this.logger.debug(`CONNECT client socket error for ${req.url}: ${err.message}`);
+      });
+      this.handleConnect(req, sock, head).catch((err) => {
         this.logger.error('CONNECT tunnel failed:', err);
-        clientSocket.destroy();
+        sock.destroy();
       });
     });
 
